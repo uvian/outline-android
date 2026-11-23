@@ -89,6 +89,7 @@ fun OutlineRichEditorView(
     serverUrl: String,
     apiKey: String,
     onMarkdownChanged: (String) -> Unit,
+    onTypingActivity: () -> Unit = {},
     onLinkClicked: (String) -> Unit,
     onImageClicked: (String) -> Unit,
     onRequestEditMode: () -> Unit,
@@ -102,11 +103,13 @@ fun OutlineRichEditorView(
     val latestServerUrl by rememberUpdatedState(serverUrl)
     val latestApiKey by rememberUpdatedState(apiKey)
     val latestOnMarkdownChanged by rememberUpdatedState(onMarkdownChanged)
+    val latestOnTypingActivity by rememberUpdatedState(onTypingActivity)
     val latestOnLinkClicked by rememberUpdatedState(onLinkClicked)
     val latestOnImageClicked by rememberUpdatedState(onImageClicked)
     val latestOnRequestEditMode by rememberUpdatedState(onRequestEditMode)
 
     val stableMarkdownCallback = remember { { md: String -> latestOnMarkdownChanged(md) } }
+    val stableTypingCallback = remember { { latestOnTypingActivity() } }
     val stableSelectionCallback = remember(controller) { { state: EditorSelectionState -> controller.updateSelection(state) } }
     val stableHeadingsCallback = remember(controller) { { items: List<HeadingItem> -> controller.updateHeadings(items) } }
     val stableLinkCallback = remember { { url: String -> latestOnLinkClicked(url) } }
@@ -124,6 +127,7 @@ fun OutlineRichEditorView(
             accentHex = latestAccent,
             readOnly = latestReadOnly,
             onMarkdownChanged = stableMarkdownCallback,
+            onTypingActivity = stableTypingCallback,
             onSelectionState = stableSelectionCallback,
             onHeadingsChanged = stableHeadingsCallback,
             onLinkClicked = stableLinkCallback,

@@ -51,6 +51,7 @@ class EditorWebViewPool(
     private var pendingLoadMarkdown: String? = null
 
     private var onMarkdownChanged: ((String) -> Unit)? = null
+    private var onTypingActivity: (() -> Unit)? = null
     private var onSelectionState: ((EditorSelectionState) -> Unit)? = null
     private var onHeadingsChanged: ((List<HeadingItem>) -> Unit)? = null
     private var onLinkClicked: ((String) -> Unit)? = null
@@ -118,6 +119,13 @@ class EditorWebViewPool(
                 fun onContentChanged(markdown: String) {
                     mainHandler.post {
                         onMarkdownChanged?.invoke(markdown)
+                    }
+                }
+
+                @JavascriptInterface
+                fun onTypingActivity() {
+                    mainHandler.post {
+                        onTypingActivity?.invoke()
                     }
                 }
 
@@ -248,6 +256,7 @@ class EditorWebViewPool(
         accentHex: String,
         readOnly: Boolean,
         onMarkdownChanged: (String) -> Unit,
+        onTypingActivity: () -> Unit,
         onSelectionState: (EditorSelectionState) -> Unit,
         onHeadingsChanged: (List<HeadingItem>) -> Unit,
         onLinkClicked: (String) -> Unit,
@@ -257,6 +266,7 @@ class EditorWebViewPool(
         currentServerUrl = serverUrl
         currentApiKey = apiKey
         this.onMarkdownChanged = onMarkdownChanged
+        this.onTypingActivity = onTypingActivity
         this.onSelectionState = onSelectionState
         this.onHeadingsChanged = onHeadingsChanged
         this.onLinkClicked = onLinkClicked
@@ -279,6 +289,7 @@ class EditorWebViewPool(
         }
         if (onMarkdownChanged === ownerCallback) {
             onMarkdownChanged = null
+            onTypingActivity = null
             onSelectionState = null
             onHeadingsChanged = null
             onLinkClicked = null

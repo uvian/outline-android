@@ -91,6 +91,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -128,8 +129,10 @@ import com.outline.notes.ui.components.OutlineRichEditorView
 import com.outline.notes.ui.components.RichEditorController
 import com.outline.notes.ui.components.TocBottomSheet
 import com.outline.notes.ui.components.UiFormatters
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -150,7 +153,8 @@ fun EditorScreen(
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
 
-    val docFlow = remember(documentId) { dao.observeDocumentById(documentId) }
+    var activeDocId by remember(documentId) { mutableStateOf(syncEngine.resolveDocumentId(documentId)) }
+    val docFlow = remember(activeDocId) { dao.observeDocumentById(activeDocId) }
     val doc by docFlow.collectAsState(initial = null)
     val collections by app.workspaceStore.collections.collectAsState()
     val allActiveDocs by app.workspaceStore.allActiveDocs.collectAsState()
@@ -168,6 +172,8 @@ fun EditorScreen(
     var bodyMarkdown by remember { mutableStateOf("") }
     var hasUnsavedInMemory by remember { mutableStateOf(false) }
     var didModifyInSession by remember { mutableStateOf(false) }
+    var typingHeartbeat by remember { mutableIntStateOf(0) }
+    var isPushingDoc by remember { mutableStateOf(false) }
     var isReadOnly by remember { mutableStateOf(settings.openInReadMode) }
 
     var showMoreMenu by remember { mutableStateOf(false) }
@@ -186,7 +192,16 @@ fun EditorScreen(
     val selectionState by richController.selectionState.collectAsState()
     val headings by richController.headings.collectAsState()
 
-    // Hydrate local state once when the document loads
+    // Shield the actively edited document from full background sync races while typing or holding unsynced changes
+    val shouldShieldFromBackgroundSync = !isReadOnly || didModifyInSession || hasUnsavedInMemory
+    DisposableEffect(activeDocId, shouldShieldFromBackgroundSync) {
+        syncEngine.setActiveEditingDocument(if (shouldShieldFromBackgroundSync) activeDocId else null)
+        onDispose {
+            syncEngine.setActiveEditingDocument(null)
+        }
+    }
+
+    // Hydrate local state once when the document loads (skipped when local_xxx is promoted to server UUID)
     LaunchedEffect(doc?.id) {
         val loaded = doc ?: return@LaunchedEffect
         if (initializedDocId != loaded.id) {
@@ -195,6 +210,9 @@ fun EditorScreen(
             bodyMarkdown = loaded.text
             // Brand-new empty notes open directly in Edit mode; deleted/archived or configured existing notes open in Read mode
             val isNewEmpty = loaded.title.isBlank() && loaded.text.isBlank()
+            if (loaded.syncState == SyncState.LOCAL_NEW && !isNewEmpty) {
+                didModifyInSession = true
+            }
             isReadOnly = when {
                 loaded.isDeleted -> true
                 isNewEmpty -> false
@@ -205,41 +223,112 @@ fun EditorScreen(
         }
     }
 
-    // Debounced local auto-save to Room DB while typing (uses calm idle sync, zero mid-typing conflict races)
-    LaunchedEffect(titleText, bodyMarkdown, initializedDocId) {
-        val activeId = initializedDocId ?: return@LaunchedEffect
+    // Debounced local auto-save to Room DB only (zero WorkManager spam, zero network contention while typing)
+    LaunchedEffect(titleText, bodyMarkdown, activeDocId) {
+        val currentId = initializedDocId ?: return@LaunchedEffect
         if (!hasUnsavedInMemory) return@LaunchedEffect
         didModifyInSession = true
-        delay(550)
-        syncEngine.saveLocalEdit(activeId, titleText, bodyMarkdown, fromActiveTyping = true)
+        delay(400)
+        syncEngine.saveLocalEdit(currentId, titleText, bodyMarkdown, fromActiveTyping = true)
         hasUnsavedInMemory = false
     }
 
-    fun flushOnAppScope(triggerSync: Boolean) {
-        val activeId = initializedDocId ?: return
-        val pendingSave = hasUnsavedInMemory
-        val modified = didModifyInSession || pendingSave
-        val finalTitle = titleText
-        val finalBody = bodyMarkdown
-        hasUnsavedInMemory = false
-        if (triggerSync) didModifyInSession = false
+    // True-resettable idle cloud push: resets to 0 on EVERY keystroke & WebView typing heartbeat!
+    // Once 5 full seconds of silence elapse, pushes ONLY this document on appScope so resuming typing mid-HTTP
+    // never cancels an in-flight create/update request.
+    LaunchedEffect(titleText, bodyMarkdown, typingHeartbeat, activeDocId, isOnline, didModifyInSession) {
+        val currentId = initializedDocId ?: return@LaunchedEffect
+        if (!didModifyInSession || !isOnline) return@LaunchedEffect
+        delay(5_000)
 
-        if (!pendingSave && !(triggerSync && modified && isOnline)) return
+        val pendingSave = hasUnsavedInMemory
+        val snapTitle = titleText
+        val snapBody = bodyMarkdown
+        if (pendingSave) hasUnsavedInMemory = false
+        isPushingDoc = true
 
         app.appScope.launch {
             if (pendingSave) {
-                syncEngine.saveLocalEdit(activeId, finalTitle, finalBody, fromActiveTyping = false)
+                syncEngine.saveLocalEdit(currentId, snapTitle, snapBody, fromActiveTyping = true)
             }
-            if (triggerSync && modified && isOnline) {
+            val result = syncEngine.pushSingleDocument(currentId)
+            withContext(Dispatchers.Main) {
+                isPushingDoc = false
+                if (result.docId != activeDocId) {
+                    initializedDocId = result.docId
+                    activeDocId = result.docId
+                }
+                if (result.synced && !hasUnsavedInMemory) {
+                    didModifyInSession = false
+                } else if (!result.synced && !result.conflict && result.errorMessage == null) {
+                    // User typed more characters while the HTTP push was in flight: re-arm calm 5s idle timer
+                    typingHeartbeat++
+                }
+            }
+        }
+    }
+
+    fun flushOnAppScope(triggerSync: Boolean, exiting: Boolean = false) {
+        val currentId = initializedDocId ?: return
+        val pendingSave = hasUnsavedInMemory
+        val finalTitle = titleText
+        val finalBody = bodyMarkdown
+        val currentSyncState = doc?.syncState
+        val hasLocalUnsyncedContent =
+            (currentSyncState == SyncState.LOCAL_NEW && (finalTitle.isNotBlank() || finalBody.isNotBlank())) ||
+                currentSyncState == SyncState.LOCAL_MODIFIED
+        val needsCloudPush = triggerSync && (didModifyInSession || pendingSave || hasLocalUnsyncedContent)
+
+        hasUnsavedInMemory = false
+        if (triggerSync && !isOnline) {
+            // Offline: WorkManager will upload once back online
+            didModifyInSession = false
+        }
+
+        if (!pendingSave && !(needsCloudPush && isOnline)) {
+            if (exiting) syncEngine.setActiveEditingDocument(null)
+            return
+        }
+
+        if (!exiting && needsCloudPush && isOnline) {
+            isPushingDoc = true
+        }
+
+        app.appScope.launch {
+            if (pendingSave) {
+                // If we are about to push right now online, skip redundant WorkManager enqueue
+                syncEngine.saveLocalEdit(
+                    documentId = currentId,
+                    title = finalTitle,
+                    text = finalBody,
+                    fromActiveTyping = (needsCloudPush && isOnline),
+                )
+            }
+            if (needsCloudPush && isOnline) {
                 com.outline.notes.data.sync.SyncWorker.cancelIdleEditSync(context.applicationContext)
-                syncEngine.syncNow(silent = true)
+                val result = syncEngine.pushSingleDocument(currentId)
+                if (!exiting) {
+                    withContext(Dispatchers.Main) {
+                        isPushingDoc = false
+                        if (result.docId != activeDocId) {
+                            initializedDocId = result.docId
+                            activeDocId = result.docId
+                        }
+                        if (result.synced && !hasUnsavedInMemory) {
+                            didModifyInSession = false
+                        }
+                    }
+                }
+            }
+            if (exiting) {
+                syncEngine.setActiveEditingDocument(null)
             }
         }
     }
 
     fun flushAndExit() {
         keyboardController?.hide()
-        flushOnAppScope(triggerSync = true)
+        flushOnAppScope(triggerSync = true, exiting = true)
         onBack()
     }
 
@@ -247,14 +336,14 @@ fun EditorScreen(
 
     DisposableEffect(Unit) {
         onDispose {
-            flushOnAppScope(triggerSync = false)
+            flushOnAppScope(triggerSync = false, exiting = true)
         }
     }
 
     fun handlePickedImageUri(uri: Uri) {
         scope.launch {
             isUploadingImage = true
-            val res = syncEngine.attachImage(documentId, uri)
+            val res = syncEngine.attachImage(activeDocId, uri)
             isUploadingImage = false
             res.onSuccess { imageUrl ->
                 if (editorMode == EditorMode.RICH_TEXT) {
@@ -263,6 +352,8 @@ fun EditorScreen(
                     val insertion = "\n![image]($imageUrl)\n"
                     bodyMarkdown += insertion
                     hasUnsavedInMemory = true
+                    didModifyInSession = true
+                    typingHeartbeat++
                 }
                 val note = if (imageUrl.startsWith(SyncEngine.OFFLINE_MEDIA_PREFIX)) {
                     "已离线缓存图片，联网后将自动上传至 MinIO"
@@ -339,6 +430,7 @@ fun EditorScreen(
                 title = {
                     val statusLabel = when {
                         isUploadingImage -> "正在压缩上传图片..."
+                        isPushingDoc -> "正在同步..."
                         hasUnsavedInMemory -> "正在保存..."
                         doc?.isDeleted == true -> "回收站"
                         doc?.syncState == SyncState.CONFLICT -> "存在冲突"
@@ -397,7 +489,7 @@ fun EditorScreen(
                         IconButton(onClick = {
                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                             scope.launch {
-                                val res = syncEngine.toggleStar(documentId)
+                                val res = syncEngine.toggleStar(activeDocId)
                                 res.onFailure { err ->
                                     snackbarHostState.showSnackbar(err.message ?: "收藏操作失败")
                                 }
@@ -427,7 +519,7 @@ fun EditorScreen(
                                     onClick = {
                                         showMoreMenu = false
                                         scope.launch {
-                                            val res = syncEngine.restoreDocument(documentId)
+                                            val res = syncEngine.restoreDocument(activeDocId)
                                             snackbarHostState.showSnackbar(
                                                 if (res.isSuccess) "已从回收站恢复" else (res.exceptionOrNull()?.message ?: "恢复失败"),
                                             )
@@ -455,12 +547,27 @@ fun EditorScreen(
                                     onClick = {
                                         showMoreMenu = false
                                         scope.launch {
+                                            isPushingDoc = true
                                             if (hasUnsavedInMemory) {
-                                                syncEngine.saveLocalEdit(documentId, titleText, bodyMarkdown)
+                                                syncEngine.saveLocalEdit(activeDocId, titleText, bodyMarkdown, fromActiveTyping = true)
                                                 hasUnsavedInMemory = false
                                             }
-                                            syncEngine.syncNow(silent = false)
-                                            snackbarHostState.showSnackbar("同步已触发")
+                                            val result = syncEngine.pushSingleDocument(activeDocId)
+                                            isPushingDoc = false
+                                            if (result.docId != activeDocId) {
+                                                initializedDocId = result.docId
+                                                activeDocId = result.docId
+                                            }
+                                            if (result.synced && !hasUnsavedInMemory) {
+                                                didModifyInSession = false
+                                            }
+                                            val msg = when {
+                                                result.conflict -> "检测到云端版本冲突，请点击顶部横幅处理"
+                                                result.errorMessage != null -> "同步失败：${result.errorMessage}"
+                                                !isOnline -> "当前离线，联网后将自动同步"
+                                                else -> "此笔记已同步到云端"
+                                            }
+                                            snackbarHostState.showSnackbar(msg)
                                         }
                                     },
                                 )
@@ -488,7 +595,7 @@ fun EditorScreen(
                                         scope.launch {
                                             val child = syncEngine.createLocalDocument(
                                                 collectionId = doc?.collectionId,
-                                                parentDocumentId = documentId,
+                                                parentDocumentId = activeDocId,
                                             )
                                             onOpenDocument(child.id)
                                         }
@@ -521,9 +628,9 @@ fun EditorScreen(
                                         showMoreMenu = false
                                         scope.launch {
                                             val res = if (archived) {
-                                                syncEngine.restoreDocument(documentId)
+                                                syncEngine.restoreDocument(activeDocId)
                                             } else {
-                                                syncEngine.archiveDocument(documentId)
+                                                syncEngine.archiveDocument(activeDocId)
                                             }
                                             val msg = if (res.isSuccess) {
                                                 if (archived) "已取消归档并恢复" else "已归档此笔记"
@@ -588,6 +695,8 @@ fun EditorScreen(
                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         bodyMarkdown = if (bodyMarkdown.isBlank()) snippet else "$bodyMarkdown\n$snippet"
                         hasUnsavedInMemory = true
+                        didModifyInSession = true
+                        typingHeartbeat++
                     },
                     onPickImage = { showImageSourceDialog = true },
                 )
@@ -623,7 +732,7 @@ fun EditorScreen(
                     TextButton(
                         onClick = {
                             scope.launch {
-                                val res = syncEngine.restoreDocument(documentId)
+                                val res = syncEngine.restoreDocument(activeDocId)
                                 snackbarHostState.showSnackbar(
                                     if (res.isSuccess) "已恢复文档" else (res.exceptionOrNull()?.message ?: "恢复失败"),
                                 )
@@ -657,7 +766,7 @@ fun EditorScreen(
                     TextButton(
                         onClick = {
                             scope.launch {
-                                val res = syncEngine.restoreDocument(documentId)
+                                val res = syncEngine.restoreDocument(activeDocId)
                                 snackbarHostState.showSnackbar(
                                     if (res.isSuccess) "已恢复文档" else (res.exceptionOrNull()?.message ?: "恢复失败"),
                                 )
@@ -699,6 +808,8 @@ fun EditorScreen(
                 onValueChange = {
                     titleText = it
                     hasUnsavedInMemory = true
+                    didModifyInSession = true
+                    typingHeartbeat++
                 },
                 readOnly = isReadOnly || doc?.isDeleted == true,
                 textStyle = TextStyle(
@@ -748,7 +859,13 @@ fun EditorScreen(
                         if (updatedMd != bodyMarkdown) {
                             bodyMarkdown = updatedMd
                             hasUnsavedInMemory = true
+                            didModifyInSession = true
+                            typingHeartbeat++
                         }
+                    },
+                    onTypingActivity = {
+                        didModifyInSession = true
+                        typingHeartbeat++
                     },
                     onLinkClicked = { rawUrl ->
                         scope.launch {
@@ -785,6 +902,8 @@ fun EditorScreen(
                     onValueChange = {
                         bodyMarkdown = it
                         hasUnsavedInMemory = true
+                        didModifyInSession = true
+                        typingHeartbeat++
                     },
                     readOnly = isReadOnly || doc?.isDeleted == true,
                     textStyle = TextStyle(
@@ -846,7 +965,7 @@ fun EditorScreen(
     // Move Document Dialog
     if (showMoveDialog) {
         MoveDocumentDialog(
-            currentDocumentId = documentId,
+            currentDocumentId = activeDocId,
             currentCollectionId = doc?.collectionId,
             currentParentId = doc?.parentDocumentId,
             collections = collections,
@@ -855,7 +974,7 @@ fun EditorScreen(
             onConfirmMove = { colId, parentId ->
                 showMoveDialog = false
                 scope.launch {
-                    val res = syncEngine.moveDocument(documentId, colId, parentId)
+                    val res = syncEngine.moveDocument(activeDocId, colId, parentId)
                     snackbarHostState.showSnackbar(
                         if (res.isSuccess) "笔记已移动" else (res.exceptionOrNull()?.message ?: "移动失败"),
                     )
@@ -937,6 +1056,8 @@ fun EditorScreen(
                                         val block = "\n:::$type\n提示内容\n:::\n"
                                         bodyMarkdown += block
                                         hasUnsavedInMemory = true
+                                        didModifyInSession = true
+                                        typingHeartbeat++
                                     }
                                 }
                                 .padding(horizontal = 14.dp, vertical = 11.dp),
@@ -965,7 +1086,7 @@ fun EditorScreen(
                 TextButton(onClick = {
                     showDeleteConfirm = false
                     scope.launch {
-                        syncEngine.deleteDocumentLocally(documentId)
+                        syncEngine.deleteDocumentLocally(activeDocId)
                         onBack()
                     }
                 }) {
@@ -987,7 +1108,7 @@ fun EditorScreen(
                 TextButton(onClick = {
                     showPermDeleteConfirm = false
                     scope.launch {
-                        val res = syncEngine.permanentlyDeleteDocument(documentId)
+                        val res = syncEngine.permanentlyDeleteDocument(activeDocId)
                         if (res.isSuccess) {
                             onBack()
                         } else {

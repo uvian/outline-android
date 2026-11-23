@@ -25,6 +25,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.time.Instant
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 sealed class SyncResult {
     data class Success(val pushed: Int, val pulled: Int, val conflicts: Int) : SyncResult()
@@ -47,6 +48,11 @@ class SyncEngine(
     private val networkMonitor: NetworkMonitor,
 ) {
     private val syncMutex = Mutex()
+    private val docWriteMutex = Mutex()
+    private val remappedLocalIds = ConcurrentHashMap<String, String>()
+
+    @Volatile
+    private var activeEditingDocId: String? = null
 
     private val _syncStatus = MutableStateFlow(SyncStatus())
     val syncStatus: StateFlow<SyncStatus> = _syncStatus.asStateFlow()
@@ -56,6 +62,126 @@ class SyncEngine(
 
     val mediaCacheDir: File
         get() = File(context.cacheDir, "media_cache").apply { mkdirs() }
+
+    /**
+     * Resolves a local temporary ID (`local_xxx`) to its promoted server UUID if already created,
+     * closing any sub-millisecond window between Room ID swap and UI state update.
+     */
+    fun resolveDocumentId(documentId: String): String = remappedLocalIds[documentId] ?: documentId
+
+    /**
+     * Marks a document as actively being typed in by the foreground editor.
+     * Full background syncs skip pushing/overwriting this document so they never race with active typing.
+     */
+    fun setActiveEditingDocument(docId: String?) {
+        activeEditingDocId = docId?.let { resolveDocumentId(it) }
+    }
+
+    /**
+     * Lightweight single-document push used after a true typing idle pause, tapping "完成", or exiting the editor.
+     * Avoids triggering a 5-second full-workspace pull and seamlessly returns the real server ID for newly created notes.
+     */
+    suspend fun pushSingleDocument(documentId: String): SinglePushResult {
+        val targetId = resolveDocumentId(documentId)
+        val settings = preferences.getSettings()
+        if (!settings.isConfigured) {
+            return SinglePushResult(docId = targetId, synced = false, conflict = false)
+        }
+        if (!networkMonitor.isOnline.value) {
+            SyncWorker.scheduleWhenConnected(context)
+            return SinglePushResult(docId = targetId, synced = false, conflict = false)
+        }
+
+        return syncMutex.withLock {
+            val effectiveId = resolveDocumentId(targetId)
+            try {
+                // Upload any pending offline attachments belonging to this document first
+                uploadPendingAttachmentsInternal(
+                    serverUrl = settings.serverUrl,
+                    apiKey = settings.apiKey,
+                    dao = dao,
+                    api = api,
+                    onlyDocumentId = effectiveId,
+                    docWriteMutex = docWriteMutex,
+                )
+
+                val current = dao.getDocumentById(effectiveId)
+                    ?: return@withLock SinglePushResult(docId = effectiveId, synced = true, conflict = false)
+
+                when (current.syncState) {
+                    SyncState.LOCAL_NEW -> {
+                        val created = api.createDocument(
+                            serverUrl = settings.serverUrl,
+                            apiKey = settings.apiKey,
+                            title = current.title,
+                            text = current.text,
+                            collectionId = current.collectionId,
+                            parentDocumentId = current.parentDocumentId?.takeUnless { it.startsWith("local_") },
+                            publish = !current.isDraft,
+                        )
+                        val pushedTitle = current.title
+                        val pushedText = current.text
+                        var stillDirty = false
+                        docWriteMutex.withLock {
+                            val latestLocal = dao.getDocumentById(current.id)
+                            val baseEntity = created.toEntity(
+                                isStarred = latestLocal?.isStarred ?: current.isStarred,
+                                starId = latestLocal?.starId ?: current.starId,
+                                treeOrder = latestLocal?.treeOrder ?: current.treeOrder,
+                            )
+                            val finalEntity = if (latestLocal != null &&
+                                (latestLocal.title != pushedTitle || latestLocal.text != pushedText)
+                            ) {
+                                stillDirty = true
+                                baseEntity.copy(
+                                    title = latestLocal.title,
+                                    text = latestLocal.text,
+                                    localUpdatedAt = latestLocal.localUpdatedAt,
+                                    syncState = SyncState.LOCAL_MODIFIED,
+                                )
+                            } else {
+                                baseEntity
+                            }
+                            dao.applyCreatedDocument(current.id, finalEntity)
+                            remappedLocalIds[current.id] = created.id
+                        }
+                        if (activeEditingDocId == current.id) {
+                            activeEditingDocId = created.id
+                        }
+                        QuickNoteWidgetProvider.requestUpdate(context)
+                        SinglePushResult(docId = created.id, synced = !stillDirty, conflict = false)
+                    }
+
+                    SyncState.LOCAL_MODIFIED -> {
+                        val outcome = pushSingleModifiedDoc(
+                            serverUrl = settings.serverUrl,
+                            apiKey = settings.apiKey,
+                            current = current,
+                            dao = dao,
+                            api = api,
+                            docWriteMutex = docWriteMutex,
+                        )
+                        QuickNoteWidgetProvider.requestUpdate(context)
+                        SinglePushResult(
+                            docId = current.id,
+                            synced = !outcome.conflict && !outcome.stillDirty,
+                            conflict = outcome.conflict,
+                        )
+                    }
+
+                    else -> SinglePushResult(
+                        docId = current.id,
+                        synced = current.syncState == SyncState.SYNCED,
+                        conflict = current.syncState == SyncState.CONFLICT,
+                    )
+                }
+            } catch (e: Exception) {
+                SyncDiagnostics.log("PUSH", "单文档快速同步失败 ($effectiveId): ${e.message}")
+                SyncWorker.scheduleWhenConnected(context)
+                SinglePushResult(docId = effectiveId, synced = false, conflict = false, errorMessage = e.message)
+            }
+        }
+    }
 
     suspend fun syncNow(silent: Boolean = false): SyncResult {
         val settings = preferences.getSettings()
@@ -83,6 +209,11 @@ class SyncEngine(
                     defaultCollectionId = settings.defaultCollectionId,
                     dao = dao,
                     api = api,
+                    skipDocumentId = activeEditingDocId,
+                    docWriteMutex = docWriteMutex,
+                    onLocalIdPromoted = { oldId, newId ->
+                        remappedLocalIds[oldId] = newId
+                    },
                     onUpdateBranding = { name, logoUrl, accentHex ->
                         preferences.updateWorkspaceBranding(name, logoUrl, accentHex)
                     },
@@ -123,7 +254,9 @@ class SyncEngine(
     }
 
     /**
-     * Create a new document locally (works 100% offline), then schedule/trigger sync.
+     * Create a new document locally (works 100% offline).
+     * When opened immediately in EditorScreen, keep [scheduleSync] = false so background WorkManager
+     * does not swap local_xxx -> server UUID underneath the open editor; EditorScreen triggers push cleanly.
      */
     suspend fun createLocalDocument(
         title: String = "",
@@ -131,6 +264,7 @@ class SyncEngine(
         collectionId: String?,
         parentDocumentId: String? = null,
         isDraft: Boolean = false,
+        scheduleSync: Boolean = false,
     ): DocumentEntity {
         val localId = "local_${UUID.randomUUID()}"
         val nowIso = Instant.now().toString()
@@ -149,16 +283,19 @@ class SyncEngine(
             localUpdatedAt = System.currentTimeMillis(),
             syncState = SyncState.LOCAL_NEW,
         )
-        dao.upsertDocument(entity)
+        docWriteMutex.withLock {
+            dao.upsertDocument(entity)
+        }
         QuickNoteWidgetProvider.requestUpdate(context)
-        SyncWorker.scheduleWhenConnected(context)
+        if (scheduleSync) {
+            SyncWorker.scheduleWhenConnected(context)
+        }
         return entity
     }
 
     /**
-     * Save edits locally immediately (offline-safe).
-     * When [fromActiveTyping] is true, schedules a calm 10-second debounced idle sync instead of
-     * immediately firing WorkManager on every keystroke pause, preventing self-induced sync races.
+     * Save edits locally immediately under [docWriteMutex] (offline-safe & race-free with background pull).
+     * When [fromActiveTyping] is true, only persists locally — EditorScreen owns the true-resettable idle push timer.
      */
     suspend fun saveLocalEdit(
         documentId: String,
@@ -166,25 +303,28 @@ class SyncEngine(
         text: String,
         fromActiveTyping: Boolean = false,
     ): DocumentEntity? {
-        val existing = dao.getDocumentById(documentId) ?: return null
-        if (existing.title == title && existing.text == text) return existing
+        val updated = docWriteMutex.withLock {
+            val resolvedId = resolveDocumentId(documentId)
+            val existing = dao.getDocumentById(resolvedId) ?: return@withLock null
+            if (existing.title == title && existing.text == text) return@withLock existing
 
-        val nextState = when (existing.syncState) {
-            SyncState.LOCAL_NEW -> SyncState.LOCAL_NEW
-            SyncState.CONFLICT -> SyncState.CONFLICT
-            else -> SyncState.LOCAL_MODIFIED
-        }
-        val updated = existing.copy(
-            title = title,
-            text = text,
-            localUpdatedAt = System.currentTimeMillis(),
-            updatedAt = Instant.now().toString(),
-            syncState = nextState,
-        )
-        dao.upsertDocument(updated)
-        if (fromActiveTyping) {
-            SyncWorker.scheduleIdleEditSync(context)
-        } else {
+            val nextState = when (existing.syncState) {
+                SyncState.LOCAL_NEW -> SyncState.LOCAL_NEW
+                SyncState.CONFLICT -> SyncState.CONFLICT
+                else -> SyncState.LOCAL_MODIFIED
+            }
+            val next = existing.copy(
+                title = title,
+                text = text,
+                localUpdatedAt = System.currentTimeMillis(),
+                updatedAt = Instant.now().toString(),
+                syncState = nextState,
+            )
+            dao.upsertDocument(next)
+            next
+        } ?: return null
+
+        if (!fromActiveTyping) {
             SyncWorker.cancelIdleEditSync(context)
             SyncWorker.scheduleWhenConnected(context)
         }
@@ -192,9 +332,10 @@ class SyncEngine(
     }
 
     suspend fun deleteDocumentLocally(documentId: String) {
-        val existing = dao.getDocumentById(documentId) ?: return
+        val resolvedId = resolveDocumentId(documentId)
+        val existing = dao.getDocumentById(resolvedId) ?: return
         if (existing.syncState == SyncState.LOCAL_NEW || existing.id.startsWith("local_")) {
-            dao.deleteDocumentById(documentId)
+            dao.deleteDocumentById(resolvedId)
         } else {
             dao.upsertDocument(
                 existing.copy(
@@ -207,10 +348,11 @@ class SyncEngine(
     }
 
     suspend fun permanentlyDeleteDocument(documentId: String): Result<Unit> {
-        val existing = dao.getDocumentById(documentId) ?: return Result.failure(IllegalStateException("文档不存在"))
+        val resolvedId = resolveDocumentId(documentId)
+        val existing = dao.getDocumentById(resolvedId) ?: return Result.failure(IllegalStateException("文档不存在"))
         val settings = preferences.getSettings()
         if (existing.id.startsWith("local_")) {
-            dao.deleteDocumentById(documentId)
+            dao.deleteDocumentById(resolvedId)
             return Result.success(Unit)
         }
         if (!settings.isConfigured || !networkMonitor.isOnline.value) {
@@ -228,7 +370,8 @@ class SyncEngine(
         targetCollectionId: String,
         targetParentDocumentId: String? = null,
     ): Result<Unit> {
-        val existing = dao.getDocumentById(documentId) ?: return Result.failure(IllegalStateException("文档不存在"))
+        val resolvedId = resolveDocumentId(documentId)
+        val existing = dao.getDocumentById(resolvedId) ?: return Result.failure(IllegalStateException("文档不存在"))
         if (existing.id.startsWith("local_")) {
             dao.upsertDocument(
                 existing.copy(
@@ -290,7 +433,7 @@ class SyncEngine(
     }
 
     suspend fun archiveDocument(documentId: String): Result<Unit> {
-        val existing = dao.getDocumentById(documentId) ?: return Result.failure(IllegalStateException("文档不存在"))
+        val existing = dao.getDocumentById(resolveDocumentId(documentId)) ?: return Result.failure(IllegalStateException("文档不存在"))
         val settings = preferences.getSettings()
         if (!settings.isConfigured || !networkMonitor.isOnline.value || existing.id.startsWith("local_")) {
             return Result.failure(IllegalStateException("归档操作需要联网且文档已同步至云端"))
@@ -308,7 +451,7 @@ class SyncEngine(
     }
 
     suspend fun restoreDocument(documentId: String): Result<Unit> {
-        val existing = dao.getDocumentById(documentId) ?: return Result.failure(IllegalStateException("文档不存在"))
+        val existing = dao.getDocumentById(resolveDocumentId(documentId)) ?: return Result.failure(IllegalStateException("文档不存在"))
         if (existing.syncState == SyncState.LOCAL_DELETED) {
             dao.upsertDocument(
                 existing.copy(
@@ -337,7 +480,7 @@ class SyncEngine(
     }
 
     suspend fun toggleStar(documentId: String): Result<Boolean> {
-        val existing = dao.getDocumentById(documentId)
+        val existing = dao.getDocumentById(resolveDocumentId(documentId))
             ?: return Result.failure(IllegalStateException("文档不存在"))
         val settings = preferences.getSettings()
         if (!settings.isConfigured || !networkMonitor.isOnline.value || existing.id.startsWith("local_")) {
@@ -400,6 +543,7 @@ class SyncEngine(
      */
     suspend fun attachImage(documentId: String, uri: Uri): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
+            val resolvedDocId = resolveDocumentId(documentId)
             val mimeType = context.contentResolver.getType(uri) ?: "image/jpeg"
             val ext = when {
                 mimeType.contains("png") -> "png"
@@ -436,7 +580,7 @@ class SyncEngine(
                         file = uploadFile,
                         fileName = finalName,
                         contentType = finalMime,
-                        documentId = documentId,
+                        documentId = resolvedDocId,
                     )
                 }.onFailure { err ->
                     SyncDiagnostics.log("UPLOAD", "MinIO 上传失败，已转入离线队列: ${err.message}")
@@ -454,7 +598,7 @@ class SyncEngine(
             dao.upsertPendingAttachment(
                 PendingAttachmentEntity(
                     id = attachId,
-                    documentId = documentId,
+                    documentId = resolvedDocId,
                     localUriMarker = marker,
                     localFilePath = uploadFile.absolutePath,
                     fileName = finalName,
@@ -473,7 +617,7 @@ class SyncEngine(
      * DUPLICATE_LOCAL: Restore server version on original doc, and save local version as a brand-new note
      */
     suspend fun resolveConflict(documentId: String, strategy: ConflictResolution): Result<Unit> {
-        val doc = dao.getDocumentById(documentId) ?: return Result.failure(IllegalStateException("文档不存在"))
+        val doc = dao.getDocumentById(resolveDocumentId(documentId)) ?: return Result.failure(IllegalStateException("文档不存在"))
         val settings = preferences.getSettings()
         return runCatching {
             when (strategy) {
@@ -595,104 +739,80 @@ class SyncEngine(
             defaultCollectionId: String,
             dao: OutlineDao,
             api: OutlineApiClient,
+            skipDocumentId: String? = null,
+            docWriteMutex: Mutex = Mutex(),
+            onLocalIdPromoted: (oldLocalId: String, newServerId: String) -> Unit = { _, _ -> },
             onUpdateBranding: suspend (workspaceName: String, logoUrl: String, accentHex: String) -> Unit = { _, _, _ -> },
             onSetDefaultCollection: suspend (collectionId: String) -> Unit = {},
         ): SyncCycleOutcome {
             var pushedCount = 0
             var conflictCount = 0
 
-            // Step 1: Upload any pending offline attachments to Outline/MinIO first
-            uploadPendingAttachmentsInternal(serverUrl, apiKey, dao, api)
+            // Step 1: Upload any pending offline attachments (skip actively edited doc)
+            uploadPendingAttachmentsInternal(
+                serverUrl = serverUrl,
+                apiKey = apiKey,
+                dao = dao,
+                api = api,
+                skipDocumentId = skipDocumentId,
+                docWriteMutex = docWriteMutex,
+            )
 
             // Step 2: Push dirty local documents (NEW, MODIFIED, DELETED)
             val dirtyDocs = dao.getDirtyDocuments()
             val orderedDirty = dirtyDocs.sortedBy { if (it.parentDocumentId == null) 0 else 1 }
 
             for (localDoc in orderedDirty) {
+                if (skipDocumentId != null && localDoc.id == skipDocumentId) continue
                 val current = dao.getDocumentById(localDoc.id) ?: continue
                 when (current.syncState) {
                     SyncState.LOCAL_NEW -> {
+                        val pushedTitle = current.title
+                        val pushedText = current.text
                         val created = api.createDocument(
                             serverUrl = serverUrl,
                             apiKey = apiKey,
-                            title = current.title,
-                            text = current.text,
+                            title = pushedTitle,
+                            text = pushedText,
                             collectionId = current.collectionId,
                             parentDocumentId = current.parentDocumentId?.takeUnless { it.startsWith("local_") },
                             publish = !current.isDraft,
                         )
-                        val syncedEntity = created.toEntity(
-                            isStarred = current.isStarred,
-                            starId = current.starId,
-                            treeOrder = current.treeOrder,
-                        )
-                        dao.applyCreatedDocument(current.id, syncedEntity)
+                        docWriteMutex.withLock {
+                            val latestLocal = dao.getDocumentById(current.id)
+                            val baseEntity = created.toEntity(
+                                isStarred = latestLocal?.isStarred ?: current.isStarred,
+                                starId = latestLocal?.starId ?: current.starId,
+                                treeOrder = latestLocal?.treeOrder ?: current.treeOrder,
+                            )
+                            val finalEntity = if (latestLocal != null &&
+                                (latestLocal.title != pushedTitle || latestLocal.text != pushedText)
+                            ) {
+                                baseEntity.copy(
+                                    title = latestLocal.title,
+                                    text = latestLocal.text,
+                                    localUpdatedAt = latestLocal.localUpdatedAt,
+                                    syncState = SyncState.LOCAL_MODIFIED,
+                                )
+                            } else {
+                                baseEntity
+                            }
+                            dao.applyCreatedDocument(current.id, finalEntity)
+                            onLocalIdPromoted(current.id, created.id)
+                        }
                         pushedCount++
                     }
 
                     SyncState.LOCAL_MODIFIED -> {
-                        // Pre-flight conflict check. Outline's documents.update does not accept an optimistic-lock
-                        // revision parameter, so we pre-check revision/updatedAt and log any post-update revision jump.
-                        val remoteCheck = runCatching {
-                            api.getDocumentInfo(serverUrl, apiKey, current.id)
-                        }.onFailure { err ->
-                            SyncDiagnostics.log("SYNC", "预检远端版本失败 (${current.id}): ${err.message}")
-                        }.getOrNull()
-
-                        val hasRemoteDiverged = remoteCheck != null && hasConflict(current, remoteCheck)
-                        if (hasRemoteDiverged && remoteCheck != null) {
-                            dao.upsertDocument(
-                                current.copy(
-                                    syncState = SyncState.CONFLICT,
-                                    conflictServerTitle = remoteCheck.title,
-                                    conflictServerText = remoteCheck.text,
-                                    conflictServerUpdatedAt = remoteCheck.updatedAt,
-                                ),
-                            )
-                            conflictCount++
-                        } else {
-                            val pushedTitle = current.title
-                            val pushedText = current.text
-                            val updated = api.updateDocument(
-                                serverUrl = serverUrl,
-                                apiKey = apiKey,
-                                documentId = current.id,
-                                title = pushedTitle,
-                                text = pushedText,
-                                publish = if (!current.isDraft) true else null,
-                            )
-                            if (current.serverBaseRevision > 0 && updated.revision > current.serverBaseRevision + 1) {
-                                SyncDiagnostics.log(
-                                    "CONFLICT_WARN",
-                                    "文档 ${current.id} 提交时检测到版本号跳跃 (${current.serverBaseRevision} -> ${updated.revision})，请按需在网页端历史记录核对",
-                                )
-                            }
-                            // Re-read local row: if user kept typing while HTTP update was in flight,
-                            // preserve their newer keystrokes AND advance serverBaseRevision so the next push
-                            // never false-conflicts against our own just-pushed revision!
-                            val latestLocal = dao.getDocumentById(current.id)
-                            if (latestLocal != null &&
-                                (latestLocal.title != pushedTitle || latestLocal.text != pushedText)
-                            ) {
-                                dao.upsertDocument(
-                                    latestLocal.copy(
-                                        revision = updated.revision,
-                                        serverBaseRevision = updated.revision,
-                                        serverBaseUpdatedAt = updated.updatedAt.orEmpty(),
-                                        syncState = SyncState.LOCAL_MODIFIED,
-                                    ),
-                                )
-                            } else {
-                                dao.upsertDocument(
-                                    updated.toEntity(
-                                        isStarred = latestLocal?.isStarred ?: current.isStarred,
-                                        starId = latestLocal?.starId ?: current.starId,
-                                        treeOrder = latestLocal?.treeOrder ?: current.treeOrder,
-                                    ),
-                                )
-                            }
-                            pushedCount++
-                        }
+                        val outcome = pushSingleModifiedDoc(
+                            serverUrl = serverUrl,
+                            apiKey = apiKey,
+                            current = current,
+                            dao = dao,
+                            api = api,
+                            docWriteMutex = docWriteMutex,
+                        )
+                        if (outcome.conflict) conflictCount++ else pushedCount++
                     }
 
                     SyncState.LOCAL_DELETED -> {
@@ -800,67 +920,157 @@ class SyncEngine(
                 mergedRemoteMap[normalized.id] = normalized
             }
 
-            val existingLocalMap = dao.getAllDocuments().associateBy { it.id }
-            val toUpsert = mutableListOf<DocumentEntity>()
+            // Hold docWriteMutex during local snapshot + applyPullBatch so concurrent saveLocalEdit is never clobbered
+            var pulledCount = 0
+            var markedMissingCount = 0
+            var prunedCount = 0
+            docWriteMutex.withLock {
+                val existingLocalMap = dao.getAllDocuments().associateBy { it.id }
+                val toUpsert = mutableListOf<DocumentEntity>()
 
-            for ((docId, remote) in mergedRemoteMap) {
-                val local = existingLocalMap[docId]
-                val isStarred = if (starByDocId != null) starByDocId.containsKey(docId) else (local?.isStarred ?: false)
-                val starId = if (starByDocId != null) starByDocId[docId]?.id else local?.starId
-                val order = treeOrderMap[docId] ?: local?.treeOrder ?: 9999
-                val treeParent = parentFromTreeMap[docId] ?: remote.parentDocumentId
+                for ((docId, remote) in mergedRemoteMap) {
+                    if (skipDocumentId != null && docId == skipDocumentId) continue
+                    val local = existingLocalMap[docId]
+                    val isStarred = if (starByDocId != null) starByDocId.containsKey(docId) else (local?.isStarred ?: false)
+                    val starId = if (starByDocId != null) starByDocId[docId]?.id else local?.starId
+                    val order = treeOrderMap[docId] ?: local?.treeOrder ?: 9999
+                    val treeParent = parentFromTreeMap[docId] ?: remote.parentDocumentId
 
-                if (local != null && local.syncState != SyncState.SYNCED) {
-                    toUpsert.add(
-                        local.copy(
-                            isStarred = isStarred,
-                            starId = starId,
-                            isArchived = !remote.archivedAt.isNullOrBlank(),
-                            archivedAt = remote.archivedAt,
-                            isDeleted = !remote.deletedAt.isNullOrBlank(),
-                            deletedAt = remote.deletedAt,
-                            treeOrder = order,
-                            remoteMissingCount = 0,
-                        ),
-                    )
-                } else {
-                    toUpsert.add(
-                        remote.toEntity(
-                            isStarred = isStarred,
-                            starId = starId,
-                            treeOrder = order,
-                            overrideParentId = treeParent,
-                        ),
-                    )
-                }
-            }
-
-            // Two-phase pruning: only delete a SYNCED local doc after it is missing on 2 consecutive full syncs
-            val remoteIds = mergedRemoteMap.keys
-            val toMarkMissing = mutableListOf<String>()
-            val toDelete = mutableListOf<String>()
-            for ((localId, localDoc) in existingLocalMap) {
-                if (localDoc.syncState == SyncState.SYNCED && localId !in remoteIds) {
-                    if (localDoc.remoteMissingCount + 1 >= MISSING_DELETE_THRESHOLD) {
-                        SyncDiagnostics.log("SYNC", "远端连续 $MISSING_DELETE_THRESHOLD 次缺失，清理本地缓存文档 $localId")
-                        toDelete.add(localId)
+                    if (local != null && local.syncState != SyncState.SYNCED) {
+                        toUpsert.add(
+                            local.copy(
+                                isStarred = isStarred,
+                                starId = starId,
+                                isArchived = !remote.archivedAt.isNullOrBlank(),
+                                archivedAt = remote.archivedAt,
+                                isDeleted = !remote.deletedAt.isNullOrBlank(),
+                                deletedAt = remote.deletedAt,
+                                treeOrder = order,
+                                remoteMissingCount = 0,
+                            ),
+                        )
                     } else {
-                        toMarkMissing.add(localId)
+                        toUpsert.add(
+                            remote.toEntity(
+                                isStarred = isStarred,
+                                starId = starId,
+                                treeOrder = order,
+                                overrideParentId = treeParent,
+                            ),
+                        )
                     }
                 }
-            }
 
-            dao.applyPullBatch(
-                toUpsert = toUpsert,
-                toMarkMissing = toMarkMissing,
-                toDelete = toDelete,
-            )
+                // Two-phase pruning: only delete a SYNCED local doc after it is missing on 2 consecutive full syncs
+                val remoteIds = mergedRemoteMap.keys
+                val toMarkMissing = mutableListOf<String>()
+                val toDelete = mutableListOf<String>()
+                for ((localId, localDoc) in existingLocalMap) {
+                    if (skipDocumentId != null && localId == skipDocumentId) continue
+                    if (localDoc.syncState == SyncState.SYNCED && localId !in remoteIds) {
+                        if (localDoc.remoteMissingCount + 1 >= MISSING_DELETE_THRESHOLD) {
+                            SyncDiagnostics.log("SYNC", "远端连续 $MISSING_DELETE_THRESHOLD 次缺失，清理本地缓存文档 $localId")
+                            toDelete.add(localId)
+                        } else {
+                            toMarkMissing.add(localId)
+                        }
+                    }
+                }
+
+                dao.applyPullBatch(
+                    toUpsert = toUpsert,
+                    toMarkMissing = toMarkMissing,
+                    toDelete = toDelete,
+                )
+                pulledCount = toUpsert.size
+                markedMissingCount = toMarkMissing.size
+                prunedCount = toDelete.size
+            }
 
             SyncDiagnostics.log(
                 "SYNC",
-                "同步成功: pushed=$pushedCount, pulled=${toUpsert.size}, stars=${starsData?.stars?.size ?: -1}, archived=${remoteArchived.size}, trash=${remoteDeleted.size}, markedMissing=${toMarkMissing.size}, pruned=${toDelete.size}, conflicts=$conflictCount",
+                "同步成功: pushed=$pushedCount, pulled=$pulledCount, stars=${starsData?.stars?.size ?: -1}, archived=${remoteArchived.size}, trash=${remoteDeleted.size}, markedMissing=$markedMissingCount, pruned=$prunedCount, conflicts=$conflictCount",
             )
-            return SyncCycleOutcome(pushed = pushedCount, pulled = toUpsert.size, conflicts = conflictCount)
+            return SyncCycleOutcome(pushed = pushedCount, pulled = pulledCount, conflicts = conflictCount)
+        }
+
+        private suspend fun pushSingleModifiedDoc(
+            serverUrl: String,
+            apiKey: String,
+            current: DocumentEntity,
+            dao: OutlineDao,
+            api: OutlineApiClient,
+            docWriteMutex: Mutex,
+        ): SingleModifyPushResult {
+            val remoteCheck = runCatching {
+                api.getDocumentInfo(serverUrl, apiKey, current.id)
+            }.onFailure { err ->
+                SyncDiagnostics.log("SYNC", "预检远端版本失败 (${current.id}): ${err.message}")
+            }.getOrNull()
+
+            val hasRemoteDiverged = remoteCheck != null && hasConflict(current, remoteCheck)
+            if (hasRemoteDiverged && remoteCheck != null) {
+                docWriteMutex.withLock {
+                    val latest = dao.getDocumentById(current.id) ?: current
+                    dao.upsertDocument(
+                        latest.copy(
+                            syncState = SyncState.CONFLICT,
+                            conflictServerTitle = remoteCheck.title,
+                            conflictServerText = remoteCheck.text,
+                            conflictServerUpdatedAt = remoteCheck.updatedAt,
+                        ),
+                    )
+                }
+                return SingleModifyPushResult(conflict = true)
+            }
+
+            val pushedTitle = current.title
+            val pushedText = current.text
+            // Do NOT pass publish=true on already-published docs; only pass null to avoid unnecessary publish reload hooks
+            val updated = api.updateDocument(
+                serverUrl = serverUrl,
+                apiKey = apiKey,
+                documentId = current.id,
+                title = pushedTitle,
+                text = pushedText,
+                publish = null,
+            )
+            if (current.serverBaseRevision > 0 && updated.revision > current.serverBaseRevision + 1) {
+                SyncDiagnostics.log(
+                    "CONFLICT_WARN",
+                    "文档 ${current.id} 提交时检测到版本号跳跃 (${current.serverBaseRevision} -> ${updated.revision})，请按需在网页端历史记录核对",
+                )
+            }
+
+            var stillDirty = false
+            docWriteMutex.withLock {
+                val latestLocal = dao.getDocumentById(current.id)
+                if (latestLocal != null &&
+                    (latestLocal.title != pushedTitle || latestLocal.text != pushedText)
+                ) {
+                    stillDirty = true
+                    // User kept typing while HTTP update was in flight: preserve newer text AND advance server base!
+                    dao.upsertDocument(
+                        latestLocal.copy(
+                            revision = updated.revision,
+                            serverBaseRevision = updated.revision,
+                            serverBaseUpdatedAt = updated.updatedAt.orEmpty(),
+                            lastSyncedServerTitle = updated.title,
+                            lastSyncedServerText = updated.text,
+                            syncState = SyncState.LOCAL_MODIFIED,
+                        ),
+                    )
+                } else {
+                    dao.upsertDocument(
+                        updated.toEntity(
+                            isStarred = latestLocal?.isStarred ?: current.isStarred,
+                            starId = latestLocal?.starId ?: current.starId,
+                            treeOrder = latestLocal?.treeOrder ?: current.treeOrder,
+                        ),
+                    )
+                }
+            }
+            return SingleModifyPushResult(conflict = false, stillDirty = stillDirty)
         }
 
         private suspend fun uploadPendingAttachmentsInternal(
@@ -868,9 +1078,17 @@ class SyncEngine(
             apiKey: String,
             dao: OutlineDao,
             api: OutlineApiClient,
+            onlyDocumentId: String? = null,
+            skipDocumentId: String? = null,
+            docWriteMutex: Mutex = Mutex(),
         ) {
-            val pendingList = dao.getAllPendingAttachments()
+            val pendingList = if (onlyDocumentId != null) {
+                dao.getPendingAttachmentsForDocument(onlyDocumentId)
+            } else {
+                dao.getAllPendingAttachments()
+            }
             for (pending in pendingList) {
+                if (skipDocumentId != null && pending.documentId == skipDocumentId) continue
                 val file = File(pending.localFilePath)
                 if (!file.exists()) {
                     dao.deletePendingAttachment(pending.id)
@@ -886,23 +1104,25 @@ class SyncEngine(
                 )
                 api.seedMediaCache(serverUrl, uploaded.url, file, pending.contentType)
 
-                val doc = dao.getDocumentById(pending.documentId)
-                if (doc != null && doc.text.contains(pending.localUriMarker)) {
-                    val updatedText = doc.text.replace(pending.localUriMarker, uploaded.url)
-                    val nextState = if (doc.syncState == SyncState.SYNCED) {
-                        SyncState.LOCAL_MODIFIED
-                    } else {
-                        doc.syncState
+                docWriteMutex.withLock {
+                    val doc = dao.getDocumentById(pending.documentId)
+                    if (doc != null && doc.text.contains(pending.localUriMarker)) {
+                        val updatedText = doc.text.replace(pending.localUriMarker, uploaded.url)
+                        val nextState = if (doc.syncState == SyncState.SYNCED) {
+                            SyncState.LOCAL_MODIFIED
+                        } else {
+                            doc.syncState
+                        }
+                        dao.upsertDocument(
+                            doc.copy(
+                                text = updatedText,
+                                localUpdatedAt = System.currentTimeMillis(),
+                                syncState = nextState,
+                            ),
+                        )
                     }
-                    dao.upsertDocument(
-                        doc.copy(
-                            text = updatedText,
-                            localUpdatedAt = System.currentTimeMillis(),
-                            syncState = nextState,
-                        ),
-                    )
+                    dao.deletePendingAttachment(pending.id)
                 }
-                dao.deletePendingAttachment(pending.id)
             }
         }
 
@@ -935,20 +1155,55 @@ class SyncEngine(
             return afterDoc.takeIf { it.isNotBlank() }
         }
 
+        internal fun normalizeForCompare(text: String): String =
+            text.replace("\r\n", "\n").trimEnd()
+
         internal fun hasConflict(local: DocumentEntity, remote: DocumentDto): Boolean {
+            val remoteTextNorm = normalizeForCompare(remote.text)
+            val localTextNorm = normalizeForCompare(local.text)
+            val remoteTitleNorm = remote.title.trim()
+            val localTitleNorm = local.title.trim()
+
+            // 1. Server already has our exact content -> no conflict
+            if (remoteTextNorm == localTextNorm && remoteTitleNorm == localTitleNorm) {
+                return false
+            }
+
+            // 2. Server still holds the exact text & title from our own last synced snapshot
+            // (e.g. Outline's async revision/Yjs hook nudged updatedAt/revision without anyone else editing)
+            if (local.lastSyncedServerText != null &&
+                remoteTextNorm == normalizeForCompare(local.lastSyncedServerText) &&
+                remoteTitleNorm == (local.lastSyncedServerTitle ?: local.title).trim()
+            ) {
+                return false
+            }
+
+            // 3. True divergence check
             if (local.serverBaseRevision > 0 && remote.revision > local.serverBaseRevision) {
-                return remote.text != local.text || remote.title != local.title
+                return true
             }
             if (local.serverBaseUpdatedAt.isNotBlank() &&
                 !remote.updatedAt.isNullOrBlank() &&
                 remote.updatedAt != local.serverBaseUpdatedAt
             ) {
-                return remote.text != local.text || remote.title != local.title
+                return true
             }
             return false
         }
     }
 }
+
+data class SinglePushResult(
+    val docId: String,
+    val synced: Boolean,
+    val conflict: Boolean,
+    val errorMessage: String? = null,
+)
+
+private data class SingleModifyPushResult(
+    val conflict: Boolean,
+    val stillDirty: Boolean = false,
+)
 
 enum class ConflictResolution {
     KEEP_LOCAL,
@@ -994,5 +1249,7 @@ private fun DocumentDto.toEntity(
         syncState = SyncState.SYNCED,
         serverBaseRevision = revision,
         serverBaseUpdatedAt = updatedAt.orEmpty(),
+        lastSyncedServerTitle = title,
+        lastSyncedServerText = text,
     )
 }

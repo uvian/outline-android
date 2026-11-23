@@ -19,6 +19,7 @@ import { OutlineCallout, preprocessOutlineCallouts, type CalloutType } from './c
 interface NativeBridge {
   onReady?: () => void;
   onContentChanged?: (markdown: string) => void;
+  onTypingActivity?: () => void;
   onSelectionState?: (stateJson: string) => void;
   onHeadingsChanged?: (headingsJson: string) => void;
   onLinkClicked?: (url: string) => void;
@@ -81,6 +82,7 @@ let isApplyingExternalContent = false;
 let isReadOnlyMode = false;
 let changeTimer: number | null = null;
 let lastTapTime = 0;
+let lastTypingNotifyTime = 0;
 
 function getMarkdownFromEditor(ed: Editor): string {
   try {
@@ -246,6 +248,11 @@ const editor = new Editor({
   onUpdate({ editor: ed }) {
     if (isApplyingExternalContent) return;
     emitSelectionState(ed);
+    const now = Date.now();
+    if (now - lastTypingNotifyTime >= 800) {
+      lastTypingNotifyTime = now;
+      window.OutlineNative?.onTypingActivity?.();
+    }
     if (changeTimer !== null) {
       window.clearTimeout(changeTimer);
     }

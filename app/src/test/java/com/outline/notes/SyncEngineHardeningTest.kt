@@ -19,6 +19,7 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okio.Buffer
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -297,6 +298,130 @@ class SyncEngineHardeningTest {
         assertEquals(SyncState.SYNCED, dao.docs["doc-fast"]?.syncState)
         assertEquals("Hello world!!", dao.docs["doc-fast"]?.text)
         assertEquals(7, dao.docs["doc-fast"]?.revision)
+    }
+
+    @Test
+    fun hasConflict_ignoresMetadataBumpWhenRemoteMatchesLastSyncedServerText() {
+        val local = DocumentEntity(
+            id = "doc-meta",
+            title = "Note",
+            text = "Hello world",
+            revision = 3,
+            serverBaseRevision = 3,
+            serverBaseUpdatedAt = "2026-11-23T10:00:00Z",
+            lastSyncedServerTitle = "Note",
+            lastSyncedServerText = "Hello",
+            syncState = SyncState.LOCAL_MODIFIED,
+        )
+        // Server's async hook bumped revision & updatedAt (and added trailing newline), but text is STILL our last synced base!
+        val remote = DocumentDto(
+            id = "doc-meta",
+            title = "Note",
+            text = "Hello\r\n",
+            revision = 4,
+            updatedAt = "2026-11-23T10:00:05Z",
+        )
+        assertFalse(
+            "Server metadata/hook bump without actual external text edit must NOT trigger false conflict",
+            SyncEngine.hasConflict(local, remote),
+        )
+    }
+
+    @Test
+    fun hasConflict_detectsGenuineExternalEditOnServer() {
+        val local = DocumentEntity(
+            id = "doc-real-conflict",
+            title = "Note",
+            text = "Edited on phone",
+            revision = 3,
+            serverBaseRevision = 3,
+            serverBaseUpdatedAt = "2026-11-23T10:00:00Z",
+            lastSyncedServerTitle = "Note",
+            lastSyncedServerText = "Original text",
+            syncState = SyncState.LOCAL_MODIFIED,
+        )
+        val remote = DocumentDto(
+            id = "doc-real-conflict",
+            title = "Note",
+            text = "Edited on PC browser",
+            revision = 4,
+            updatedAt = "2026-11-23T10:01:00Z",
+        )
+        assertTrue(
+            "Genuine external text change on server must still be detected as CONFLICT",
+            SyncEngine.hasConflict(local, remote),
+        )
+    }
+
+    @Test
+    fun executeSyncCycle_skipsActivelyEditedDocument() = runTest {
+        val dao = FakeOutlineDao().apply {
+            docs["doc-active"] = DocumentEntity(
+                id = "doc-active",
+                title = "Typing in progress",
+                text = "Half-typed sentence...",
+                revision = 2,
+                serverBaseRevision = 2,
+                serverBaseUpdatedAt = "2026-11-23T10:00:00Z",
+                syncState = SyncState.LOCAL_MODIFIED,
+            )
+            docs["doc-other"] = DocumentEntity(
+                id = "doc-other",
+                title = "Other Note",
+                text = "Old",
+                revision = 1,
+                syncState = SyncState.SYNCED,
+            )
+        }
+
+        var updatedIds = mutableListOf<String>()
+        val api = object : FakeOutlineApiClient() {
+            override suspend fun updateDocument(
+                serverUrl: String,
+                apiKey: String,
+                documentId: String,
+                title: String,
+                text: String,
+                publish: Boolean?,
+            ): DocumentDto {
+                updatedIds.add(documentId)
+                return DocumentDto(id = documentId, title = title, text = text, revision = 3, updatedAt = "2026-11-23T10:05:00Z")
+            }
+
+            override suspend fun listAllDocuments(serverUrl: String, apiKey: String, collectionId: String?) = listOf(
+                DocumentDto(
+                    id = "doc-active",
+                    title = "Stale server version",
+                    text = "Must not clobber active typing",
+                    revision = 2,
+                    publishedAt = "2026-11-20T00:00:00Z",
+                    updatedAt = "2026-11-23T10:00:00Z",
+                ),
+                DocumentDto(
+                    id = "doc-other",
+                    title = "Other Note Updated",
+                    text = "Fresh from server",
+                    revision = 2,
+                    publishedAt = "2026-11-20T00:00:00Z",
+                    updatedAt = "2026-11-23T10:02:00Z",
+                ),
+            )
+        }
+
+        val outcome = SyncEngine.executeSyncCycle(
+            serverUrl = "https://wiki.example.com",
+            apiKey = "key",
+            defaultCollectionId = "",
+            dao = dao,
+            api = api,
+            skipDocumentId = "doc-active",
+        )
+
+        assertEquals(0, outcome.conflicts)
+        assertTrue("Actively edited doc must NOT be pushed by background sync", "doc-active" !in updatedIds)
+        assertEquals("Half-typed sentence...", dao.docs["doc-active"]?.text)
+        assertEquals(SyncState.LOCAL_MODIFIED, dao.docs["doc-active"]?.syncState)
+        assertEquals("Fresh from server", dao.docs["doc-other"]?.text)
     }
 
     @Test

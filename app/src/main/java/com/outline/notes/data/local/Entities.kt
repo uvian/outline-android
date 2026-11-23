@@ -57,6 +57,8 @@ data class DocumentEntity(
     val remoteMissingCount: Int = 0,
     val serverBaseRevision: Int = 0,
     val serverBaseUpdatedAt: String = "",
+    val lastSyncedServerTitle: String? = null,
+    val lastSyncedServerText: String? = null,
     val conflictServerTitle: String? = null,
     val conflictServerText: String? = null,
     val conflictServerUpdatedAt: String? = null,
