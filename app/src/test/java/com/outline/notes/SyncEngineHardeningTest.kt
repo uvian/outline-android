@@ -214,6 +214,92 @@ class SyncEngineHardeningTest {
     }
 
     @Test
+    fun fastTypingDuringUpdate_preservesNewKeystrokesAndPreventsSelfConflict() = runTest {
+        val dao = FakeOutlineDao().apply {
+            docs["doc-fast"] = DocumentEntity(
+                id = "doc-fast",
+                title = "Fast Note",
+                text = "Hello",
+                revision = 5,
+                serverBaseRevision = 5,
+                serverBaseUpdatedAt = "2026-11-23T10:00:00Z",
+                syncState = SyncState.LOCAL_MODIFIED,
+            )
+        }
+
+        var serverRev = 5
+        var serverText = "Initial"
+        var serverUpdatedAt = "2026-11-23T10:00:00Z"
+
+        val api = object : FakeOutlineApiClient() {
+            override suspend fun getDocumentInfo(serverUrl: String, apiKey: String, documentId: String): DocumentDto {
+                return DocumentDto(
+                    id = documentId,
+                    title = "Fast Note",
+                    text = serverText,
+                    revision = serverRev,
+                    publishedAt = "2026-11-20T00:00:00Z",
+                    updatedAt = serverUpdatedAt,
+                )
+            }
+
+            override suspend fun updateDocument(
+                serverUrl: String,
+                apiKey: String,
+                documentId: String,
+                title: String,
+                text: String,
+                publish: Boolean?,
+            ): DocumentDto {
+                // Simulate user typing MORE characters into local DB while the first HTTP update is in flight!
+                if (text == "Hello") {
+                    val cur = dao.docs[documentId]!!
+                    dao.docs[documentId] = cur.copy(
+                        text = "Hello world!!",
+                        syncState = SyncState.LOCAL_MODIFIED,
+                    )
+                }
+                serverRev += 1
+                serverText = text
+                serverUpdatedAt = "2026-11-23T10:00:0${serverRev}Z"
+                return DocumentDto(
+                    id = documentId,
+                    title = title,
+                    text = serverText,
+                    revision = serverRev,
+                    publishedAt = "2026-11-20T00:00:00Z",
+                    updatedAt = serverUpdatedAt,
+                )
+            }
+
+            override suspend fun listAllDocuments(serverUrl: String, apiKey: String, collectionId: String?) = listOf(
+                DocumentDto(
+                    id = "doc-fast",
+                    title = "Fast Note",
+                    text = serverText,
+                    revision = serverRev,
+                    publishedAt = "2026-11-20T00:00:00Z",
+                    updatedAt = serverUpdatedAt,
+                ),
+            )
+        }
+
+        // Sync #1 pushes "Hello" (rev 5 -> 6) while user types "Hello world!!" mid-flight
+        val firstOutcome = SyncEngine.executeSyncCycle("https://wiki.example.com", "key", "", dao, api)
+        assertEquals(0, firstOutcome.conflicts)
+        assertEquals("Hello world!!", dao.docs["doc-fast"]?.text)
+        assertEquals(SyncState.LOCAL_MODIFIED, dao.docs["doc-fast"]?.syncState)
+        assertEquals(6, dao.docs["doc-fast"]?.serverBaseRevision)
+
+        // Sync #2 pushes "Hello world!!" (rev 6 -> 7) — MUST NOT false-conflict against rev 6!
+        val secondOutcome = SyncEngine.executeSyncCycle("https://wiki.example.com", "key", "", dao, api)
+        assertEquals(0, secondOutcome.conflicts)
+        assertEquals(SyncState.SYNCED, dao.docs["doc-fast"]?.syncState)
+        assertEquals("Hello world!!", dao.docs["doc-fast"]?.text)
+        assertEquals(7, dao.docs["doc-fast"]?.revision)
+    }
+
+    @Test
     fun p1_5_streamingMediaCache_atomicWriteOversizeRejectAndLruEviction() {
         val cacheDir = Files.createTempDirectory("outline_media_test_").toFile()
         val server = MockWebServer()

@@ -35,8 +35,13 @@ class SyncWorker(
 
     companion object {
         private const val WORK_NAME = "outline_auto_sync"
+        private const val IDLE_EDIT_WORK_NAME = "outline_idle_edit_sync"
         private const val PERIODIC_WORK_NAME = "outline_periodic_sync"
 
+        /**
+         * Enqueues a sync without cancelling an already-running sync mid-HTTP-push
+         * (prevents killing in-flight documents.update before local serverBaseRevision updates).
+         */
         fun scheduleWhenConnected(context: Context) {
             val constraints = Constraints.Builder()
                 .setRequiredNetworkType(NetworkType.CONNECTED)
@@ -49,9 +54,35 @@ class SyncWorker(
 
             WorkManager.getInstance(context).enqueueUniqueWork(
                 WORK_NAME,
+                ExistingWorkPolicy.APPEND_OR_REPLACE,
+                request,
+            )
+        }
+
+        /**
+         * Debounced idle-edit sync (default 10s after last keystroke) so rapid typing never
+         * triggers overlapping uploads against itself, while still auto-uploading if the user pauses.
+         */
+        fun scheduleIdleEditSync(context: Context, delaySeconds: Long = 10L) {
+            val constraints = Constraints.Builder()
+                .setRequiredNetworkType(NetworkType.CONNECTED)
+                .build()
+
+            val request = OneTimeWorkRequestBuilder<SyncWorker>()
+                .setConstraints(constraints)
+                .setInitialDelay(delaySeconds, TimeUnit.SECONDS)
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 20, TimeUnit.SECONDS)
+                .build()
+
+            WorkManager.getInstance(context).enqueueUniqueWork(
+                IDLE_EDIT_WORK_NAME,
                 ExistingWorkPolicy.REPLACE,
                 request,
             )
+        }
+
+        fun cancelIdleEditSync(context: Context) {
+            WorkManager.getInstance(context).cancelUniqueWork(IDLE_EDIT_WORK_NAME)
         }
 
         fun configurePeriodicSync(context: Context, enabled: Boolean) {

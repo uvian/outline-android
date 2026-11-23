@@ -156,12 +156,15 @@ class SyncEngine(
     }
 
     /**
-     * Save edits locally immediately (offline-safe). Never loses keystrokes.
+     * Save edits locally immediately (offline-safe).
+     * When [fromActiveTyping] is true, schedules a calm 10-second debounced idle sync instead of
+     * immediately firing WorkManager on every keystroke pause, preventing self-induced sync races.
      */
     suspend fun saveLocalEdit(
         documentId: String,
         title: String,
         text: String,
+        fromActiveTyping: Boolean = false,
     ): DocumentEntity? {
         val existing = dao.getDocumentById(documentId) ?: return null
         if (existing.title == title && existing.text == text) return existing
@@ -179,7 +182,12 @@ class SyncEngine(
             syncState = nextState,
         )
         dao.upsertDocument(updated)
-        SyncWorker.scheduleWhenConnected(context)
+        if (fromActiveTyping) {
+            SyncWorker.scheduleIdleEditSync(context)
+        } else {
+            SyncWorker.cancelIdleEditSync(context)
+            SyncWorker.scheduleWhenConnected(context)
+        }
         return updated
     }
 
@@ -643,12 +651,14 @@ class SyncEngine(
                             )
                             conflictCount++
                         } else {
+                            val pushedTitle = current.title
+                            val pushedText = current.text
                             val updated = api.updateDocument(
                                 serverUrl = serverUrl,
                                 apiKey = apiKey,
                                 documentId = current.id,
-                                title = current.title,
-                                text = current.text,
+                                title = pushedTitle,
+                                text = pushedText,
                                 publish = if (!current.isDraft) true else null,
                             )
                             if (current.serverBaseRevision > 0 && updated.revision > current.serverBaseRevision + 1) {
@@ -657,13 +667,30 @@ class SyncEngine(
                                     "文档 ${current.id} 提交时检测到版本号跳跃 (${current.serverBaseRevision} -> ${updated.revision})，请按需在网页端历史记录核对",
                                 )
                             }
-                            dao.upsertDocument(
-                                updated.toEntity(
-                                    isStarred = current.isStarred,
-                                    starId = current.starId,
-                                    treeOrder = current.treeOrder,
-                                ),
-                            )
+                            // Re-read local row: if user kept typing while HTTP update was in flight,
+                            // preserve their newer keystrokes AND advance serverBaseRevision so the next push
+                            // never false-conflicts against our own just-pushed revision!
+                            val latestLocal = dao.getDocumentById(current.id)
+                            if (latestLocal != null &&
+                                (latestLocal.title != pushedTitle || latestLocal.text != pushedText)
+                            ) {
+                                dao.upsertDocument(
+                                    latestLocal.copy(
+                                        revision = updated.revision,
+                                        serverBaseRevision = updated.revision,
+                                        serverBaseUpdatedAt = updated.updatedAt.orEmpty(),
+                                        syncState = SyncState.LOCAL_MODIFIED,
+                                    ),
+                                )
+                            } else {
+                                dao.upsertDocument(
+                                    updated.toEntity(
+                                        isStarred = latestLocal?.isStarred ?: current.isStarred,
+                                        starId = latestLocal?.starId ?: current.starId,
+                                        treeOrder = latestLocal?.treeOrder ?: current.treeOrder,
+                                    ),
+                                )
+                            }
                             pushedCount++
                         }
                     }

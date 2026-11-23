@@ -205,13 +205,13 @@ fun EditorScreen(
         }
     }
 
-    // Debounced auto-save to Room DB so zero keystrokes are ever lost (even offline)
+    // Debounced local auto-save to Room DB while typing (uses calm idle sync, zero mid-typing conflict races)
     LaunchedEffect(titleText, bodyMarkdown, initializedDocId) {
         val activeId = initializedDocId ?: return@LaunchedEffect
         if (!hasUnsavedInMemory) return@LaunchedEffect
         didModifyInSession = true
         delay(550)
-        syncEngine.saveLocalEdit(activeId, titleText, bodyMarkdown)
+        syncEngine.saveLocalEdit(activeId, titleText, bodyMarkdown, fromActiveTyping = true)
         hasUnsavedInMemory = false
     }
 
@@ -228,9 +228,10 @@ fun EditorScreen(
 
         app.appScope.launch {
             if (pendingSave) {
-                syncEngine.saveLocalEdit(activeId, finalTitle, finalBody)
+                syncEngine.saveLocalEdit(activeId, finalTitle, finalBody, fromActiveTyping = false)
             }
             if (triggerSync && modified && isOnline) {
+                com.outline.notes.data.sync.SyncWorker.cancelIdleEditSync(context.applicationContext)
                 syncEngine.syncNow(silent = true)
             }
         }
