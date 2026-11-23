@@ -1,6 +1,8 @@
 package com.outline.notes.data.remote
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.builtins.ListSerializer
@@ -21,6 +23,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
@@ -30,7 +33,7 @@ class OutlineApiException(
     override val message: String,
 ) : IOException(message)
 
-class OutlineApiClient(
+open class OutlineApiClient(
     private val mediaCacheDir: File? = null,
 ) {
     val json = Json {
@@ -64,6 +67,7 @@ class OutlineApiClient(
         body: JsonObject = buildJsonObject {},
         dataSerializer: KSerializer<T>,
     ): ApiResponse<T> = withContext(Dispatchers.IO) {
+        currentCoroutineContext().ensureActive()
         val base = serverUrl.trimEnd('/')
         val url = "$base/api/$method"
         val request = Request.Builder()
@@ -98,16 +102,37 @@ class OutlineApiClient(
         }
     }
 
-    suspend fun authInfo(serverUrl: String, apiKey: String): AuthInfoData {
+    /**
+     * Unified cancellable pagination helper across Outline RPC list endpoints.
+     */
+    private suspend fun <T> paginate(
+        limit: Int = DEFAULT_PAGE_LIMIT,
+        fetchPage: suspend (offset: Int, limit: Int) -> Pair<List<T>, PaginationDto?>,
+    ): List<T> {
+        val all = mutableListOf<T>()
+        var offset = 0
+        while (true) {
+            currentCoroutineContext().ensureActive()
+            val (batch, pagination) = fetchPage(offset, limit)
+            all.addAll(batch)
+            val hasNext = if (pagination != null) {
+                !pagination.nextPath.isNullOrBlank() || batch.size >= limit
+            } else {
+                batch.size >= limit
+            }
+            if (!hasNext || batch.isEmpty()) break
+            offset += batch.size.coerceAtLeast(limit)
+        }
+        return all
+    }
+
+    open suspend fun authInfo(serverUrl: String, apiKey: String): AuthInfoData {
         val res = postRpc(serverUrl, apiKey, "auth.info", buildJsonObject {}, AuthInfoData.serializer())
         return res.data ?: throw OutlineApiException(500, "Empty auth.info response")
     }
 
-    suspend fun listCollections(serverUrl: String, apiKey: String): List<CollectionDto> {
-        val all = mutableListOf<CollectionDto>()
-        var offset = 0
-        val limit = 100
-        while (true) {
+    open suspend fun listCollections(serverUrl: String, apiKey: String): List<CollectionDto> {
+        return paginate { offset, limit ->
             val res = postRpc(
                 serverUrl = serverUrl,
                 apiKey = apiKey,
@@ -118,15 +143,11 @@ class OutlineApiClient(
                 },
                 dataSerializer = ListSerializer(CollectionDto.serializer()),
             )
-            val batch = res.data.orEmpty()
-            all.addAll(batch)
-            if (batch.size < limit) break
-            offset += limit
+            res.data.orEmpty() to res.pagination
         }
-        return all
     }
 
-    suspend fun createCollection(
+    open suspend fun createCollection(
         serverUrl: String,
         apiKey: String,
         name: String,
@@ -147,7 +168,7 @@ class OutlineApiClient(
         return res.data ?: throw OutlineApiException(500, "Empty collections.create response")
     }
 
-    suspend fun collectionDocumentsTree(
+    open suspend fun collectionDocumentsTree(
         serverUrl: String,
         apiKey: String,
         collectionId: String,
@@ -162,15 +183,12 @@ class OutlineApiClient(
         return res.data.orEmpty()
     }
 
-    suspend fun listAllDocuments(
+    open suspend fun listAllDocuments(
         serverUrl: String,
         apiKey: String,
         collectionId: String? = null,
     ): List<DocumentDto> {
-        val all = mutableListOf<DocumentDto>()
-        var offset = 0
-        val limit = 100
-        while (true) {
+        return paginate { offset, limit ->
             val res = postRpc(
                 serverUrl = serverUrl,
                 apiKey = apiKey,
@@ -186,19 +204,12 @@ class OutlineApiClient(
                 },
                 dataSerializer = ListSerializer(DocumentDto.serializer()),
             )
-            val batch = res.data.orEmpty()
-            all.addAll(batch)
-            if (batch.size < limit) break
-            offset += limit
+            res.data.orEmpty() to res.pagination
         }
-        return all
     }
 
-    suspend fun listDrafts(serverUrl: String, apiKey: String): List<DocumentDto> {
-        val all = mutableListOf<DocumentDto>()
-        var offset = 0
-        val limit = 100
-        while (true) {
+    open suspend fun listDrafts(serverUrl: String, apiKey: String): List<DocumentDto> {
+        return paginate { offset, limit ->
             val res = postRpc(
                 serverUrl = serverUrl,
                 apiKey = apiKey,
@@ -209,19 +220,12 @@ class OutlineApiClient(
                 },
                 dataSerializer = ListSerializer(DocumentDto.serializer()),
             )
-            val batch = res.data.orEmpty()
-            all.addAll(batch)
-            if (batch.size < limit) break
-            offset += limit
+            res.data.orEmpty() to res.pagination
         }
-        return all
     }
 
-    suspend fun listArchivedDocuments(serverUrl: String, apiKey: String): List<DocumentDto> {
-        val all = mutableListOf<DocumentDto>()
-        var offset = 0
-        val limit = 100
-        while (true) {
+    open suspend fun listArchivedDocuments(serverUrl: String, apiKey: String): List<DocumentDto> {
+        return paginate { offset, limit ->
             val res = postRpc(
                 serverUrl = serverUrl,
                 apiKey = apiKey,
@@ -234,19 +238,12 @@ class OutlineApiClient(
                 },
                 dataSerializer = ListSerializer(DocumentDto.serializer()),
             )
-            val batch = res.data.orEmpty()
-            all.addAll(batch)
-            if (batch.size < limit) break
-            offset += limit
+            res.data.orEmpty() to res.pagination
         }
-        return all
     }
 
-    suspend fun listDeletedDocuments(serverUrl: String, apiKey: String): List<DocumentDto> {
-        val all = mutableListOf<DocumentDto>()
-        var offset = 0
-        val limit = 100
-        while (true) {
+    open suspend fun listDeletedDocuments(serverUrl: String, apiKey: String): List<DocumentDto> {
+        return paginate { offset, limit ->
             val res = postRpc(
                 serverUrl = serverUrl,
                 apiKey = apiKey,
@@ -259,15 +256,11 @@ class OutlineApiClient(
                 },
                 dataSerializer = ListSerializer(DocumentDto.serializer()),
             )
-            val batch = res.data.orEmpty()
-            all.addAll(batch)
-            if (batch.size < limit) break
-            offset += limit
+            res.data.orEmpty() to res.pagination
         }
-        return all
     }
 
-    suspend fun moveDocument(
+    open suspend fun moveDocument(
         serverUrl: String,
         apiKey: String,
         documentId: String,
@@ -289,7 +282,7 @@ class OutlineApiClient(
         )
     }
 
-    suspend fun archiveDocument(
+    open suspend fun archiveDocument(
         serverUrl: String,
         apiKey: String,
         documentId: String,
@@ -304,7 +297,7 @@ class OutlineApiClient(
         return res.data ?: throw OutlineApiException(500, "Empty documents.archive response")
     }
 
-    suspend fun restoreDocument(
+    open suspend fun restoreDocument(
         serverUrl: String,
         apiKey: String,
         documentId: String,
@@ -319,7 +312,7 @@ class OutlineApiClient(
         return res.data ?: throw OutlineApiException(500, "Empty documents.restore response")
     }
 
-    suspend fun getDocumentInfo(
+    open suspend fun getDocumentInfo(
         serverUrl: String,
         apiKey: String,
         documentId: String,
@@ -334,7 +327,7 @@ class OutlineApiClient(
         return res.data ?: throw OutlineApiException(404, "Document not found")
     }
 
-    suspend fun createDocument(
+    open suspend fun createDocument(
         serverUrl: String,
         apiKey: String,
         title: String,
@@ -359,7 +352,7 @@ class OutlineApiClient(
         return res.data ?: throw OutlineApiException(500, "Empty documents.create response")
     }
 
-    suspend fun updateDocument(
+    open suspend fun updateDocument(
         serverUrl: String,
         apiKey: String,
         documentId: String,
@@ -383,7 +376,7 @@ class OutlineApiClient(
         return res.data ?: throw OutlineApiException(500, "Empty documents.update response")
     }
 
-    suspend fun deleteDocument(
+    open suspend fun deleteDocument(
         serverUrl: String,
         apiKey: String,
         documentId: String,
@@ -401,7 +394,7 @@ class OutlineApiClient(
         )
     }
 
-    suspend fun searchDocuments(
+    open suspend fun searchDocuments(
         serverUrl: String,
         apiKey: String,
         query: String,
@@ -426,13 +419,9 @@ class OutlineApiClient(
      * and legacy array shape:
      *   { data: [...] }
      */
-    suspend fun listStars(serverUrl: String, apiKey: String): StarsListData {
-        val allStars = mutableListOf<StarDto>()
+    open suspend fun listStars(serverUrl: String, apiKey: String): StarsListData {
         val allDocs = mutableListOf<DocumentDto>()
-        var offset = 0
-        val limit = 100
-
-        while (true) {
+        val allStars = paginate { offset, limit ->
             val res = postRpc(
                 serverUrl = serverUrl,
                 apiKey = apiKey,
@@ -443,8 +432,8 @@ class OutlineApiClient(
                 },
                 dataSerializer = JsonElement.serializer(),
             )
-            val dataElem = res.data ?: break
-            val batchStars: List<StarDto> = when (dataElem) {
+            val dataElem = res.data
+            val batchStars = when (dataElem) {
                 is JsonObject -> {
                     val parsed = json.decodeFromJsonElement(StarsListData.serializer(), dataElem)
                     allDocs.addAll(parsed.documents)
@@ -455,14 +444,12 @@ class OutlineApiClient(
                 }
                 else -> emptyList()
             }
-            allStars.addAll(batchStars)
-            if (batchStars.size < limit) break
-            offset += limit
+            batchStars to res.pagination
         }
         return StarsListData(stars = allStars, documents = allDocs)
     }
 
-    suspend fun createStar(
+    open suspend fun createStar(
         serverUrl: String,
         apiKey: String,
         documentId: String,
@@ -477,7 +464,7 @@ class OutlineApiClient(
         return res.data ?: throw OutlineApiException(500, "Empty stars.create response")
     }
 
-    suspend fun deleteStar(
+    open suspend fun deleteStar(
         serverUrl: String,
         apiKey: String,
         starId: String,
@@ -493,9 +480,8 @@ class OutlineApiClient(
 
     /**
      * Two-step Outline attachment upload supporting MinIO / S3 presigned POST and local Outline storage.
-     * Returns the Outline attachment URL (e.g. /api/attachments.redirect?id=...).
      */
-    suspend fun uploadAttachment(
+    open suspend fun uploadAttachment(
         serverUrl: String,
         apiKey: String,
         file: File,
@@ -533,7 +519,6 @@ class OutlineApiClient(
         }
 
         val multipartBuilder = MultipartBody.Builder().setType(MultipartBody.FORM)
-        // S3 / MinIO requires all policy/signature form fields BEFORE the 'file' part
         createData.form.forEach { (key, value) ->
             val strVal = (value as? JsonPrimitive)?.contentOrNull ?: value.toString()
             multipartBuilder.addFormDataPart(key, strVal)
@@ -546,9 +531,11 @@ class OutlineApiClient(
             .url(resolvedUploadUrl)
             .post(multipartBuilder.build())
 
-        // Only send Outline Bearer token if uploading back to Outline's own local endpoint,
-        // NOT to S3/MinIO presigned POST (MinIO rejects conflicting Authorization headers).
-        if (isSameOriginAsOutline && createData.form.none { it.key.equals("X-Amz-Signature", ignoreCase = true) || it.key.equals("Policy", ignoreCase = true) }) {
+        if (isSameOriginAsOutline && createData.form.none {
+                it.key.equals("X-Amz-Signature", ignoreCase = true) ||
+                    it.key.equals("Policy", ignoreCase = true)
+            }
+        ) {
             uploadReqBuilder.header("Authorization", "Bearer $apiKey")
         }
 
@@ -566,13 +553,14 @@ class OutlineApiClient(
     }
 
     /**
-     * Fetches an Outline attachment/image with Bearer auth and caches it locally on disk
-     * so images remain viewable offline inside the WYSIWYG WebView.
+     * Streams an Outline attachment/image safely to disk via a temp file + atomic rename
+     * with a per-file size cap to prevent OOM and partial-file corruption.
      */
     fun fetchAndCacheMediaBlocking(
         serverUrl: String,
         apiKey: String,
         rawUrl: String,
+        maxFileBytes: Long = MAX_SINGLE_MEDIA_BYTES,
     ): CachedMedia? {
         val resolved = resolveUrl(serverUrl, rawUrl)
         val cacheKey = sha256(resolved)
@@ -581,6 +569,8 @@ class OutlineApiClient(
         val metaFile = cacheDir?.let { File(it, "$cacheKey.mime") }
 
         if (dataFile != null && dataFile.exists() && dataFile.length() > 0L) {
+            // Touch mtime for LRU tracking
+            dataFile.setLastModified(System.currentTimeMillis())
             val mime = metaFile?.takeIf { it.exists() }?.readText()?.trim().orEmpty().ifBlank { "image/png" }
             return CachedMedia(file = dataFile, mimeType = mime)
         }
@@ -595,19 +585,126 @@ class OutlineApiClient(
         return runCatching {
             httpClient.newCall(reqBuilder.build()).execute().use { resp ->
                 if (!resp.isSuccessful) return@use null
-                val bytes = resp.body?.bytes() ?: return@use null
+                val body = resp.body ?: return@use null
+                val contentLength = body.contentLength()
+                if (contentLength > maxFileBytes) return@use null
+
                 val mime = resp.header("Content-Type")?.substringBefore(';')?.trim()
                     .orEmpty()
                     .ifBlank { "image/png" }
-                if (dataFile != null && metaFile != null) {
-                    dataFile.writeBytes(bytes)
-                    metaFile.writeText(mime)
-                    CachedMedia(file = dataFile, mimeType = mime)
+
+                if (cacheDir != null && dataFile != null && metaFile != null) {
+                    val tmpFile = File(cacheDir, "$cacheKey.${System.nanoTime()}.tmp")
+                    var totalRead = 0L
+                    var exceeded = false
+                    try {
+                        body.byteStream().use { input ->
+                            FileOutputStream(tmpFile).use { output ->
+                                val buf = ByteArray(16 * 1024)
+                                while (true) {
+                                    val n = input.read(buf)
+                                    if (n < 0) break
+                                    totalRead += n
+                                    if (totalRead > maxFileBytes) {
+                                        exceeded = true
+                                        break
+                                    }
+                                    output.write(buf, 0, n)
+                                }
+                            }
+                        }
+                        if (exceeded || totalRead == 0L) {
+                            tmpFile.delete()
+                            return@use null
+                        }
+                        if (!tmpFile.renameTo(dataFile)) {
+                            tmpFile.copyTo(dataFile, overwrite = true)
+                            tmpFile.delete()
+                        }
+                        metaFile.writeText(mime)
+                        CachedMedia(file = dataFile, mimeType = mime)
+                    } catch (t: Throwable) {
+                        tmpFile.delete()
+                        throw t
+                    }
                 } else {
+                    val bytes = body.bytes()
+                    if (bytes.size > maxFileBytes) return@use null
                     CachedMedia(bytes = bytes, mimeType = mime)
                 }
             }
         }.getOrNull()
+    }
+
+    /**
+     * Copies a locally uploaded attachment into the media cache under its new server URL
+     * so it remains immediately viewable offline without re-downloading.
+     */
+    fun seedMediaCache(
+        serverUrl: String,
+        rawUrl: String,
+        sourceFile: File,
+        mimeType: String,
+    ) {
+        val cacheDir = mediaCacheDir?.apply { mkdirs() } ?: return
+        if (!sourceFile.exists() || sourceFile.length() == 0L || sourceFile.length() > MAX_SINGLE_MEDIA_BYTES) return
+        runCatching {
+            val resolved = resolveUrl(serverUrl, rawUrl)
+            val cacheKey = sha256(resolved)
+            val dataFile = File(cacheDir, "$cacheKey.bin")
+            val metaFile = File(cacheDir, "$cacheKey.mime")
+            val tmpFile = File(cacheDir, "$cacheKey.${System.nanoTime()}.tmp")
+            sourceFile.copyTo(tmpFile, overwrite = true)
+            if (!tmpFile.renameTo(dataFile)) {
+                tmpFile.copyTo(dataFile, overwrite = true)
+                tmpFile.delete()
+            }
+            metaFile.writeText(mimeType.ifBlank { "image/jpeg" })
+        }
+    }
+
+    /**
+     * Enforces TTL + LRU total size budget on the disk media cache.
+     */
+    fun pruneMediaCache(
+        maxTotalBytes: Long = MAX_TOTAL_CACHE_BYTES,
+        maxAgeMillis: Long = DEFAULT_CACHE_TTL_MS,
+    ) {
+        val dir = mediaCacheDir ?: return
+        if (!dir.exists()) return
+        val now = System.currentTimeMillis()
+
+        // Remove any leftover temp files first
+        dir.listFiles { f -> f.name.endsWith(".tmp") }?.forEach { it.delete() }
+
+        val binFiles = dir.listFiles { f -> f.isFile && f.name.endsWith(".bin") }?.toMutableList() ?: return
+
+        // 1. TTL eviction
+        val iterator = binFiles.iterator()
+        while (iterator.hasNext()) {
+            val file = iterator.next()
+            if (now - file.lastModified() > maxAgeMillis) {
+                deleteCacheEntry(dir, file)
+                iterator.remove()
+            }
+        }
+
+        // 2. LRU total-size eviction (oldest lastModified first)
+        var totalSize = binFiles.sumOf { it.length() }
+        if (totalSize > maxTotalBytes) {
+            binFiles.sortBy { it.lastModified() }
+            for (file in binFiles) {
+                if (totalSize <= maxTotalBytes) break
+                totalSize -= file.length()
+                deleteCacheEntry(dir, file)
+            }
+        }
+    }
+
+    private fun deleteCacheEntry(dir: File, binFile: File) {
+        val base = binFile.name.removeSuffix(".bin")
+        binFile.delete()
+        File(dir, "$base.mime").delete()
     }
 
     fun getCachedMediaFile(serverUrl: String, rawUrl: String): File? {
@@ -636,6 +733,13 @@ class OutlineApiClient(
     private fun sha256(input: String): String {
         val digest = MessageDigest.getInstance("SHA-256").digest(input.toByteArray())
         return digest.joinToString("") { "%02x".format(it) }
+    }
+
+    companion object {
+        private const val DEFAULT_PAGE_LIMIT = 100
+        const val MAX_SINGLE_MEDIA_BYTES = 20L * 1024L * 1024L // 20 MB per cached image
+        const val MAX_TOTAL_CACHE_BYTES = 150L * 1024L * 1024L // 150 MB total LRU cap
+        const val DEFAULT_CACHE_TTL_MS = 14L * 24L * 60L * 60L * 1000L // 14 days
     }
 }
 

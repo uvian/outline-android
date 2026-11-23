@@ -25,8 +25,8 @@ android {
         applicationId = "com.outline.notes"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "2.0.1"
+        versionCode = 6
+        versionName = "2.0.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -84,6 +84,10 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
+}
+
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
 }
 
 dependencies {

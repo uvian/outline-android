@@ -54,6 +54,7 @@ data class DocumentEntity(
     val updatedAt: String = "",
     val localUpdatedAt: Long = System.currentTimeMillis(),
     val syncState: String = SyncState.SYNCED,
+    val remoteMissingCount: Int = 0,
     val serverBaseRevision: Int = 0,
     val serverBaseUpdatedAt: String = "",
     val conflictServerTitle: String? = null,

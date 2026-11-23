@@ -14,8 +14,8 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         DocumentFtsEntity::class,
         PendingAttachmentEntity::class,
     ],
-    version = 3,
-    exportSchema = false,
+    version = 4,
+    exportSchema = true,
 )
 abstract class OutlineDatabase : RoomDatabase() {
     abstract fun outlineDao(): OutlineDao
@@ -24,18 +24,18 @@ abstract class OutlineDatabase : RoomDatabase() {
         @Volatile
         private var instance: OutlineDatabase? = null
 
-        private val MIGRATION_1_2 = object : Migration(1, 2) {
+        val MIGRATION_1_2 = object : Migration(1, 2) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("ALTER TABLE documents ADD COLUMN isArchived INTEGER NOT NULL DEFAULT 0")
                 db.execSQL("ALTER TABLE documents ADD COLUMN archivedAt TEXT")
             }
         }
 
-        private val MIGRATION_2_3 = object : Migration(2, 3) {
+        val MIGRATION_2_3 = object : Migration(2, 3) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("ALTER TABLE documents ADD COLUMN isDeleted INTEGER NOT NULL DEFAULT 0")
                 db.execSQL("ALTER TABLE documents ADD COLUMN deletedAt TEXT")
-                db.execSQL("CREATE INDEX IF NOT EXISTS index_documents_urlId ON documents(urlId)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_documents_urlId` ON `documents` (`urlId`)")
                 db.execSQL(
                     "CREATE VIRTUAL TABLE IF NOT EXISTS `documents_fts` USING FTS4(`title` TEXT NOT NULL, `text` TEXT NOT NULL, content=`documents`)",
                 )
@@ -55,6 +55,12 @@ abstract class OutlineDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE documents ADD COLUMN remoteMissingCount INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
         fun getInstance(context: Context): OutlineDatabase {
             return instance ?: synchronized(this) {
                 instance ?: Room.databaseBuilder(
@@ -62,8 +68,7 @@ abstract class OutlineDatabase : RoomDatabase() {
                     OutlineDatabase::class.java,
                     "outline_notes.db",
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
-                    .fallbackToDestructiveMigration()
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
                     .build()
                     .also { instance = it }
             }

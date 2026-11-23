@@ -20,7 +20,7 @@ jobs:
           cache: "npm"
           cache-dependency-path: editor-web/package-lock.json
 
-      - name: Build offline Tiptap editor bundle
+      - name: Build offline Tiptap editor bundle & verify consistency
         working-directory: editor-web
         run: |
           npm ci
@@ -36,10 +36,10 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Run Unit Tests & Build Debug APK
+      - name: Run Unit Tests, Lint & Build Debug APK
         run: |
           chmod +x gradlew
-          ./gradlew testDebugUnitTest assembleDebug
+          ./gradlew testDebugUnitTest lintDebug assembleDebug
 
       - name: Upload Debug APK artifact
         uses: actions/upload-artifact@v4

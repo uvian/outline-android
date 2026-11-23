@@ -3,7 +3,6 @@ package com.outline.notes.ui.screens
 import android.content.Intent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.biometric.BiometricManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -71,6 +70,7 @@ import com.outline.notes.data.prefs.EditorMode
 import com.outline.notes.data.prefs.ThemeMode
 import com.outline.notes.data.prefs.UserSettings
 import com.outline.notes.data.remote.OutlineApiClient
+import com.outline.notes.data.security.BiometricGate
 import com.outline.notes.data.sync.SyncDiagnostics
 import com.outline.notes.data.sync.SyncEngine
 import com.outline.notes.data.sync.SyncResult
@@ -107,13 +107,7 @@ fun SettingsScreen(
         mutableStateOf(settings.customAccentColor.ifBlank { settings.effectiveAccentColor })
     }
 
-    val canUseBiometric = remember {
-        val bm = BiometricManager.from(context)
-        val status = bm.canAuthenticate(
-            BiometricManager.Authenticators.BIOMETRIC_WEAK or BiometricManager.Authenticators.DEVICE_CREDENTIAL,
-        )
-        status == BiometricManager.BIOMETRIC_SUCCESS
-    }
+    val canUseBiometric = remember { BiometricGate.isAvailable(context) }
 
     val backupLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/zip"),
@@ -414,7 +408,11 @@ fun SettingsScreen(
                 }
                 SettingsToggleRow(
                     title = "生物识别 / 锁屏密码应用锁",
-                    subtitle = if (canUseBiometric) "打开应用时需通过指纹、面容或系统密码验证" else "当前设备未设置锁屏密码或生物识别",
+                    subtitle = if (canUseBiometric) {
+                        "启动与切后台超过 45 秒后需验证身份，并禁止最近任务截屏预览"
+                    } else {
+                        "本机未设置生物识别或锁屏密码，应用锁未生效"
+                    },
                     checked = settings.biometricLockEnabled,
                     enabled = canUseBiometric,
                     onCheckedChange = { enabled ->

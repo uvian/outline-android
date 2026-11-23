@@ -5,11 +5,11 @@ import android.graphics.drawable.ColorDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
+import android.view.WindowManager
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.biometric.BiometricManager
-import androidx.biometric.BiometricPrompt
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -30,7 +30,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.toArgb
-import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
@@ -39,6 +38,7 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.outline.notes.data.prefs.ThemeMode
 import com.outline.notes.data.prefs.UserSettings
+import com.outline.notes.data.security.BiometricGate
 import com.outline.notes.ui.components.BiometricLockOverlay
 import com.outline.notes.ui.screens.EditorScreen
 import com.outline.notes.ui.screens.HomeScreen
@@ -68,6 +68,8 @@ class MainActivity : FragmentActivity() {
     private var pendingAction by mutableStateOf<ExternalLaunchAction?>(null)
     private var isBiometricUnlocked by mutableStateOf(false)
     private var hasPromptedBiometric by mutableStateOf(false)
+    private var backgroundedAtElapsedMs: Long = 0L
+    private var biometricLockEnabledFlag: Boolean = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -113,6 +115,17 @@ class MainActivity : FragmentActivity() {
                             )
                         },
                     )
+                }
+
+                // Sync FLAG_SECURE & track biometric preference for grace-period background re-lock
+                val lockEnabled = currentSettings?.biometricLockEnabled == true
+                LaunchedEffect(lockEnabled) {
+                    biometricLockEnabledFlag = lockEnabled
+                    if (lockEnabled) {
+                        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                    } else {
+                        window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                    }
                 }
 
                 // Only enforce biometric lock if it was already enabled on app launch
@@ -172,36 +185,34 @@ class MainActivity : FragmentActivity() {
         }
     }
 
+    override fun onStop() {
+        super.onStop()
+        if (biometricLockEnabledFlag && isBiometricUnlocked) {
+            backgroundedAtElapsedMs = SystemClock.elapsedRealtime()
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        if (biometricLockEnabledFlag && isBiometricUnlocked && backgroundedAtElapsedMs > 0L) {
+            val awayMs = SystemClock.elapsedRealtime() - backgroundedAtElapsedMs
+            backgroundedAtElapsedMs = 0L
+            if (awayMs >= BiometricGate.RELOCK_GRACE_PERIOD_MS) {
+                isBiometricUnlocked = false
+                hasPromptedBiometric = false
+            }
+        }
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         pendingAction = extractExternalAction(intent)
     }
 
     private fun triggerBiometricPrompt() {
-        val authenticators = BiometricManager.Authenticators.BIOMETRIC_WEAK or
-            BiometricManager.Authenticators.DEVICE_CREDENTIAL
-        val bm = BiometricManager.from(this)
-        if (bm.canAuthenticate(authenticators) != BiometricManager.BIOMETRIC_SUCCESS) {
+        BiometricGate.authenticate(this) {
             isBiometricUnlocked = true
-            return
         }
-
-        val executor = ContextCompat.getMainExecutor(this)
-        val prompt = BiometricPrompt(
-            this,
-            executor,
-            object : BiometricPrompt.AuthenticationCallback() {
-                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                    isBiometricUnlocked = true
-                }
-            },
-        )
-        val info = BiometricPrompt.PromptInfo.Builder()
-            .setTitle("解锁 Outline Notes")
-            .setSubtitle("验证身份以访问你的私人笔记")
-            .setAllowedAuthenticators(authenticators)
-            .build()
-        prompt.authenticate(info)
     }
 
     private fun extractExternalAction(intent: Intent?): ExternalLaunchAction? {

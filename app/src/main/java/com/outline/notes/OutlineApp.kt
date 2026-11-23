@@ -60,6 +60,7 @@ class OutlineApp : Application() {
         }
 
         appScope.launch {
+            apiClient.pruneMediaCache()
             val settings = preferences.getSettings()
             SyncWorker.configurePeriodicSync(this@OutlineApp, settings.isConfigured && settings.periodicSyncEnabled)
         }

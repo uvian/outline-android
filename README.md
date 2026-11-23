@@ -88,6 +88,13 @@ cd ..
 
 ---
 
+## Contributors / 贡献者
+
+- **[@uvian](https://github.com/uvian)** — Project creator, product direction, real-device testing & maintainer
+- **Antigravity (Google DeepMind)** — Architecture, Kotlin/Compose & Tiptap editor implementation, sync engine & engineering hardening
+
+---
+
 ## License
 
 [MIT License](LICENSE)

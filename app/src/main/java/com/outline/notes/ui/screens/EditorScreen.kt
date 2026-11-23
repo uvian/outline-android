@@ -395,7 +395,12 @@ fun EditorScreen(
                     if (doc?.isDeleted != true) {
                         IconButton(onClick = {
                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                            scope.launch { syncEngine.toggleStar(documentId) }
+                            scope.launch {
+                                val res = syncEngine.toggleStar(documentId)
+                                res.onFailure { err ->
+                                    snackbarHostState.showSnackbar(err.message ?: "收藏操作失败")
+                                }
+                            }
                         }) {
                             val starred = doc?.isStarred == true
                             Icon(

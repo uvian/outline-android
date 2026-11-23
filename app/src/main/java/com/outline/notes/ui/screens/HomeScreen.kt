@@ -406,7 +406,12 @@ fun HomeScreen(
                                     onClick = { onOpenDocument(doc.id) },
                                     onToggleStar = {
                                         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                        scope.launch { syncEngine.toggleStar(doc.id) }
+                                        scope.launch {
+                                            val res = syncEngine.toggleStar(doc.id)
+                                            res.onFailure { err ->
+                                                snackbarHostState.showSnackbar(err.message ?: "收藏操作失败")
+                                            }
+                                        }
                                     },
                                 )
                             }

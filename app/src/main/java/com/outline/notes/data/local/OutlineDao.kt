@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import androidx.room.Update
 import kotlinx.coroutines.flow.Flow
 
@@ -104,11 +105,47 @@ interface OutlineDao {
     @Query("DELETE FROM documents WHERE id = :id")
     suspend fun deleteDocumentById(id: String)
 
+    @Query("UPDATE documents SET remoteMissingCount = remoteMissingCount + 1 WHERE id = :id")
+    suspend fun incrementRemoteMissingCount(id: String)
+
     @Query("UPDATE documents SET parentDocumentId = :newParentId WHERE parentDocumentId = :oldParentId")
     suspend fun remapParentDocumentId(oldParentId: String, newParentId: String)
 
     @Query("DELETE FROM documents")
     suspend fun clearDocuments()
+
+    @Transaction
+    suspend fun applyCollectionsSnapshot(items: List<CollectionEntity>) {
+        upsertCollections(items)
+        if (items.isNotEmpty()) {
+            deleteCollectionsNotIn(items.map { it.id })
+        }
+    }
+
+    @Transaction
+    suspend fun applyCreatedDocument(localId: String, synced: DocumentEntity) {
+        deleteDocumentById(localId)
+        upsertDocument(synced)
+        remapParentDocumentId(localId, synced.id)
+        remapPendingAttachmentDocId(localId, synced.id)
+    }
+
+    @Transaction
+    suspend fun applyPullBatch(
+        toUpsert: List<DocumentEntity>,
+        toMarkMissing: List<String>,
+        toDelete: List<String>,
+    ) {
+        if (toUpsert.isNotEmpty()) {
+            upsertDocuments(toUpsert)
+        }
+        for (id in toMarkMissing) {
+            incrementRemoteMissingCount(id)
+        }
+        for (id in toDelete) {
+            deleteDocumentById(id)
+        }
+    }
 
     // Pending Attachments
     @Query("SELECT * FROM pending_attachments ORDER BY createdAt ASC")

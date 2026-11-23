@@ -146,6 +146,16 @@ fun SetupScreen(
                 modifier = Modifier.fillMaxWidth(),
             )
 
+            if (serverUrl.trim().startsWith("http://", ignoreCase = true)) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = "提示：当前使用 HTTP 非加密连接，建议仅在受信任的局域网或 VPN 中使用。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+
             Spacer(modifier = Modifier.height(16.dp))
 
             // API Key

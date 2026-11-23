@@ -77,241 +77,26 @@ class SyncEngine(
             SyncDiagnostics.log("SYNC", "开始同步 (silent=$silent, server=${settings.serverUrl})")
             _syncStatus.value = _syncStatus.value.copy(isSyncing = true, lastError = null, message = "正在同步...")
             try {
-                var pushedCount = 0
-                var conflictCount = 0
-
-                // Step 1: Upload any pending offline attachments to Outline/MinIO first
-                uploadPendingAttachments(settings.serverUrl, settings.apiKey)
-
-                // Step 2: Push dirty local documents (NEW, MODIFIED, DELETED)
-                val dirtyDocs = dao.getDirtyDocuments()
-                // Push parents before children if both are locally created
-                val orderedDirty = dirtyDocs.sortedBy { if (it.parentDocumentId == null) 0 else 1 }
-
-                for (localDoc in orderedDirty) {
-                    // Re-read latest version (attachment URLs or parent IDs may have just been remapped)
-                    val current = dao.getDocumentById(localDoc.id) ?: continue
-                    when (current.syncState) {
-                        SyncState.LOCAL_NEW -> {
-                            val created = api.createDocument(
-                                serverUrl = settings.serverUrl,
-                                apiKey = settings.apiKey,
-                                title = current.title,
-                                text = current.text,
-                                collectionId = current.collectionId,
-                                parentDocumentId = current.parentDocumentId?.takeUnless { it.startsWith("local_") },
-                                publish = !current.isDraft,
-                            )
-                            val syncedEntity = created.toEntity(
-                                isStarred = current.isStarred,
-                                starId = current.starId,
-                                treeOrder = current.treeOrder,
-                            )
-                            dao.deleteDocumentById(current.id)
-                            dao.upsertDocument(syncedEntity)
-                            dao.remapParentDocumentId(current.id, created.id)
-                            dao.remapPendingAttachmentDocId(current.id, created.id)
-                            pushedCount++
-                        }
-
-                        SyncState.LOCAL_MODIFIED -> {
-                            // Conflict check against remote document before overwriting
-                            val remoteCheck = runCatching {
-                                api.getDocumentInfo(settings.serverUrl, settings.apiKey, current.id)
-                            }.getOrNull()
-
-                            val hasRemoteDiverged = remoteCheck != null && hasConflict(current, remoteCheck)
-                            if (hasRemoteDiverged && remoteCheck != null) {
-                                dao.upsertDocument(
-                                    current.copy(
-                                        syncState = SyncState.CONFLICT,
-                                        conflictServerTitle = remoteCheck.title,
-                                        conflictServerText = remoteCheck.text,
-                                        conflictServerUpdatedAt = remoteCheck.updatedAt,
-                                    ),
-                                )
-                                conflictCount++
-                            } else {
-                                val updated = api.updateDocument(
-                                    serverUrl = settings.serverUrl,
-                                    apiKey = settings.apiKey,
-                                    documentId = current.id,
-                                    title = current.title,
-                                    text = current.text,
-                                    publish = if (!current.isDraft) true else null,
-                                )
-                                dao.upsertDocument(
-                                    updated.toEntity(
-                                        isStarred = current.isStarred,
-                                        starId = current.starId,
-                                        treeOrder = current.treeOrder,
-                                    ),
-                                )
-                                pushedCount++
-                            }
-                        }
-
-                        SyncState.LOCAL_DELETED -> {
-                            if (!current.id.startsWith("local_")) {
-                                runCatching {
-                                    api.deleteDocument(settings.serverUrl, settings.apiKey, current.id)
-                                }
-                            }
-                            dao.deleteDocumentById(current.id)
-                            pushedCount++
-                        }
-                    }
-                }
-
-                // Step 2.5: Sync workspace branding (server name, logo URL, custom accent color)
-                runCatching {
-                    val auth = api.authInfo(settings.serverUrl, settings.apiKey)
-                    val team = auth.team
-                    if (team != null) {
-                        val logoUrl = team.avatarUrl.orEmpty()
-                        val accentHex = team.preferences?.customTheme?.accent.orEmpty()
-                        preferences.updateWorkspaceBranding(
-                            workspaceName = team.name,
-                            workspaceLogoUrl = logoUrl,
-                            serverAccentColor = accentHex,
-                        )
-                        if (logoUrl.isNotBlank()) {
-                            withContext(Dispatchers.IO) {
-                                api.fetchAndCacheMediaBlocking(settings.serverUrl, settings.apiKey, logoUrl)
-                            }
-                        }
-                    }
-                }
-
-                // Step 3: Pull Collections
-                val remoteCollections = api.listCollections(settings.serverUrl, settings.apiKey)
-                val collectionEntities = remoteCollections.mapIndexed { idx, col ->
-                    CollectionEntity(
-                        id = col.id,
-                        name = col.name,
-                        description = col.description.orEmpty(),
-                        color = col.color ?: "#0366D6",
-                        icon = col.icon,
-                        sortIndex = col.index ?: idx.toString().padStart(4, '0'),
-                        updatedAt = col.updatedAt.orEmpty(),
-                    )
-                }
-                dao.upsertCollections(collectionEntities)
-                if (collectionEntities.isNotEmpty()) {
-                    dao.deleteCollectionsNotIn(collectionEntities.map { it.id })
-                    if (settings.defaultCollectionId.isBlank()) {
-                        preferences.setDefaultCollectionId(collectionEntities.first().id)
-                    }
-                }
-
-                // Step 4: Pull document hierarchy order for each collection
-                val treeOrderMap = mutableMapOf<String, Int>()
-                val parentFromTreeMap = mutableMapOf<String, String?>()
-                for (col in remoteCollections) {
-                    val nodes = runCatching {
-                        api.collectionDocumentsTree(settings.serverUrl, settings.apiKey, col.id)
-                    }.getOrDefault(emptyList())
-                    flattenTreeOrder(nodes, null, treeOrderMap, parentFromTreeMap)
-                }
-
-                // Step 5: Pull Stars (latest Outline returns { data: { stars, documents } })
-                val starsData = runCatching {
-                    api.listStars(settings.serverUrl, settings.apiKey)
-                }.getOrDefault(com.outline.notes.data.remote.StarsListData())
-                val starByDocId = starsData.stars
-                    .filter { !it.documentId.isNullOrBlank() }
-                    .associateBy { it.documentId!! }
-
-                // Step 6: Pull Documents, Drafts, Archived, Deleted (Trash), and Starred Documents
-                val remoteDocs = api.listAllDocuments(settings.serverUrl, settings.apiKey)
-                val remoteDrafts = runCatching {
-                    api.listDrafts(settings.serverUrl, settings.apiKey)
-                }.getOrDefault(emptyList())
-                val remoteArchived = runCatching {
-                    api.listArchivedDocuments(settings.serverUrl, settings.apiKey)
-                }.getOrDefault(emptyList())
-                val remoteDeleted = runCatching {
-                    api.listDeletedDocuments(settings.serverUrl, settings.apiKey)
-                }.getOrDefault(emptyList())
-
-                val mergedRemoteMap = linkedMapOf<String, DocumentDto>()
-                remoteDocs.forEach { mergedRemoteMap[it.id] = it }
-                remoteDrafts.forEach { mergedRemoteMap.putIfAbsent(it.id, it) }
-                starsData.documents.forEach { mergedRemoteMap.putIfAbsent(it.id, it) }
-                remoteArchived.forEach { archivedDoc ->
-                    val normalized = if (archivedDoc.archivedAt.isNullOrBlank()) {
-                        archivedDoc.copy(archivedAt = archivedDoc.updatedAt ?: Instant.now().toString())
-                    } else {
-                        archivedDoc
-                    }
-                    mergedRemoteMap[normalized.id] = normalized
-                }
-                remoteDeleted.forEach { deletedDoc ->
-                    val normalized = if (deletedDoc.deletedAt.isNullOrBlank()) {
-                        deletedDoc.copy(deletedAt = deletedDoc.updatedAt ?: Instant.now().toString())
-                    } else {
-                        deletedDoc
-                    }
-                    mergedRemoteMap[normalized.id] = normalized
-                }
-
-                val existingLocalMap = dao.getAllDocuments().associateBy { it.id }
-                val toUpsert = mutableListOf<DocumentEntity>()
-
-                for ((docId, remote) in mergedRemoteMap) {
-                    val local = existingLocalMap[docId]
-                    val star = starByDocId[docId]
-                    val order = treeOrderMap[docId] ?: 9999
-                    val treeParent = parentFromTreeMap[docId] ?: remote.parentDocumentId
-
-                    // Never clobber an unsynced or conflict local document
-                    if (local != null && local.syncState != SyncState.SYNCED) {
-                        toUpsert.add(
-                            local.copy(
-                                isStarred = star != null,
-                                starId = star?.id,
-                                isArchived = !remote.archivedAt.isNullOrBlank(),
-                                archivedAt = remote.archivedAt,
-                                isDeleted = !remote.deletedAt.isNullOrBlank(),
-                                deletedAt = remote.deletedAt,
-                                treeOrder = order,
-                            ),
-                        )
-                    } else {
-                        toUpsert.add(
-                            remote.toEntity(
-                                isStarred = star != null,
-                                starId = star?.id,
-                                treeOrder = order,
-                                overrideParentId = treeParent,
-                            ),
-                        )
-                    }
-                }
-
-                if (toUpsert.isNotEmpty()) {
-                    dao.upsertDocuments(toUpsert)
-                }
-
-                // Remove locally synced docs that no longer exist on the server (permanently deleted)
-                val remoteIds = mergedRemoteMap.keys
-                for ((localId, localDoc) in existingLocalMap) {
-                    if (localDoc.syncState == SyncState.SYNCED && localId !in remoteIds) {
-                        dao.deleteDocumentById(localId)
-                    }
-                }
-
+                val outcome = executeSyncCycle(
+                    serverUrl = settings.serverUrl,
+                    apiKey = settings.apiKey,
+                    defaultCollectionId = settings.defaultCollectionId,
+                    dao = dao,
+                    api = api,
+                    onUpdateBranding = { name, logoUrl, accentHex ->
+                        preferences.updateWorkspaceBranding(name, logoUrl, accentHex)
+                    },
+                    onSetDefaultCollection = { colId ->
+                        preferences.setDefaultCollectionId(colId)
+                    },
+                )
                 val now = System.currentTimeMillis()
                 preferences.setLastSyncAt(now)
                 QuickNoteWidgetProvider.requestUpdate(context)
-                SyncDiagnostics.log(
-                    "SYNC",
-                    "同步成功: pushed=$pushedCount, pulled=${toUpsert.size}, stars=${starsData.stars.size}, archived=${remoteArchived.size}, trash=${remoteDeleted.size}, conflicts=$conflictCount",
-                )
                 val statusMsg = when {
-                    conflictCount > 0 -> "同步完成，发现 $conflictCount 篇冲突笔记需要处理"
-                    pushedCount > 0 -> "已上传 $pushedCount 项更改，共 ${toUpsert.size} 篇笔记"
-                    else -> "已是最新（共 ${toUpsert.size} 篇笔记）"
+                    outcome.conflicts > 0 -> "同步完成，发现 ${outcome.conflicts} 篇冲突笔记需要处理"
+                    outcome.pushed > 0 -> "已上传 ${outcome.pushed} 项更改，共 ${outcome.pulled} 篇笔记"
+                    else -> "已是最新（共 ${outcome.pulled} 篇笔记）"
                 }
                 _syncStatus.value = SyncStatus(
                     isSyncing = false,
@@ -319,7 +104,7 @@ class SyncEngine(
                     lastSyncedAt = now,
                     message = statusMsg,
                 )
-                SyncResult.Success(pushed = pushedCount, pulled = toUpsert.size, conflicts = conflictCount)
+                SyncResult.Success(pushed = outcome.pushed, pulled = outcome.pulled, conflicts = outcome.conflicts)
             } catch (e: Exception) {
                 val msg = when (e) {
                     is OutlineApiException -> "服务器返回错误 (${e.statusCode}): ${e.message}"
@@ -334,44 +119,6 @@ class SyncEngine(
                 SyncWorker.scheduleWhenConnected(context)
                 SyncResult.Error(msg)
             }
-        }
-    }
-
-    private suspend fun uploadPendingAttachments(serverUrl: String, apiKey: String) {
-        val pendingList = dao.getAllPendingAttachments()
-        for (pending in pendingList) {
-            val file = File(pending.localFilePath)
-            if (!file.exists()) {
-                dao.deletePendingAttachment(pending.id)
-                continue
-            }
-            val uploaded = api.uploadAttachment(
-                serverUrl = serverUrl,
-                apiKey = apiKey,
-                file = file,
-                fileName = pending.fileName,
-                contentType = pending.contentType,
-                documentId = pending.documentId,
-            )
-            // Replace offline image URL in the document text with real Outline attachment URL
-            val doc = dao.getDocumentById(pending.documentId)
-            if (doc != null && doc.text.contains(pending.localUriMarker)) {
-                val updatedText = doc.text.replace(pending.localUriMarker, uploaded.url)
-                val nextState = if (doc.syncState == SyncState.SYNCED) {
-                    SyncState.LOCAL_MODIFIED
-                } else {
-                    doc.syncState
-                }
-                dao.upsertDocument(
-                    doc.copy(
-                        text = updatedText,
-                        localUpdatedAt = System.currentTimeMillis(),
-                        syncState = nextState,
-                    ),
-                )
-            }
-            // Also keep a copy in mediaCache so it remains cached offline under the new URL
-            dao.deletePendingAttachment(pending.id)
         }
     }
 
@@ -581,23 +328,40 @@ class SyncEngine(
         }
     }
 
-    suspend fun toggleStar(documentId: String) {
-        val existing = dao.getDocumentById(documentId) ?: return
-        val newStarred = !existing.isStarred
-        dao.upsertDocument(existing.copy(isStarred = newStarred))
-
+    suspend fun toggleStar(documentId: String): Result<Boolean> {
+        val existing = dao.getDocumentById(documentId)
+            ?: return Result.failure(IllegalStateException("文档不存在"))
         val settings = preferences.getSettings()
         if (!settings.isConfigured || !networkMonitor.isOnline.value || existing.id.startsWith("local_")) {
-            return
+            return Result.failure(IllegalStateException("收藏操作需要联网且文档已同步至云端"))
         }
-        runCatching {
+
+        val newStarred = !existing.isStarred
+        // Optimistic update for snappy UI, with rollback on failure
+        dao.upsertDocument(existing.copy(isStarred = newStarred))
+
+        return try {
             if (newStarred) {
                 val created = api.createStar(settings.serverUrl, settings.apiKey, existing.id)
                 dao.upsertDocument(existing.copy(isStarred = true, starId = created.id))
             } else if (!existing.starId.isNullOrBlank()) {
                 api.deleteStar(settings.serverUrl, settings.apiKey, existing.starId)
                 dao.upsertDocument(existing.copy(isStarred = false, starId = null))
+            } else {
+                // Star ID unknown locally: refresh stars from server to stay accurate
+                val stars = api.listStars(settings.serverUrl, settings.apiKey)
+                val match = stars.stars.firstOrNull { it.documentId == existing.id }
+                if (match != null) {
+                    api.deleteStar(settings.serverUrl, settings.apiKey, match.id)
+                }
+                dao.upsertDocument(existing.copy(isStarred = false, starId = null))
             }
+            Result.success(newStarred)
+        } catch (e: Exception) {
+            // Rollback local optimistic state
+            dao.upsertDocument(existing)
+            SyncDiagnostics.log("STAR", "收藏状态同步失败，已回滚 (${existing.id}): ${e.message}")
+            Result.failure(e)
         }
     }
 
@@ -671,6 +435,7 @@ class SyncEngine(
                 }.getOrNull()
 
                 if (uploaded != null && uploaded.url.isNotBlank()) {
+                    api.seedMediaCache(settings.serverUrl, uploaded.url, uploadFile, finalMime)
                     SyncDiagnostics.log("UPLOAD", "图片上传成功: $finalName (${uploadFile.length()} B)")
                     return@runCatching uploaded.url
                 }
@@ -807,24 +572,327 @@ class SyncEngine(
         }
     }
 
-    private fun flattenTreeOrder(
-        nodes: List<NavigationNodeDto>,
-        parentId: String?,
-        orderOut: MutableMap<String, Int>,
-        parentOut: MutableMap<String, String?>,
-    ) {
-        for (node in nodes) {
-            orderOut[node.id] = orderOut.size
-            parentOut[node.id] = parentId
-            if (node.children.isNotEmpty()) {
-                flattenTreeOrder(node.children, node.id, orderOut, parentOut)
-            }
-        }
-    }
-
     companion object {
         const val OFFLINE_MEDIA_HOST = "local.outline.app"
         const val OFFLINE_MEDIA_PREFIX = "https://local.outline.app/offline-media/"
+        const val MISSING_DELETE_THRESHOLD = 2
+
+        /**
+         * Pure orchestration core for one complete push+pull sync cycle.
+         * Separated cleanly so JVM unit tests can exercise conflict/failure/transaction paths against a fake DAO & API.
+         */
+        internal suspend fun executeSyncCycle(
+            serverUrl: String,
+            apiKey: String,
+            defaultCollectionId: String,
+            dao: OutlineDao,
+            api: OutlineApiClient,
+            onUpdateBranding: suspend (workspaceName: String, logoUrl: String, accentHex: String) -> Unit = { _, _, _ -> },
+            onSetDefaultCollection: suspend (collectionId: String) -> Unit = {},
+        ): SyncCycleOutcome {
+            var pushedCount = 0
+            var conflictCount = 0
+
+            // Step 1: Upload any pending offline attachments to Outline/MinIO first
+            uploadPendingAttachmentsInternal(serverUrl, apiKey, dao, api)
+
+            // Step 2: Push dirty local documents (NEW, MODIFIED, DELETED)
+            val dirtyDocs = dao.getDirtyDocuments()
+            val orderedDirty = dirtyDocs.sortedBy { if (it.parentDocumentId == null) 0 else 1 }
+
+            for (localDoc in orderedDirty) {
+                val current = dao.getDocumentById(localDoc.id) ?: continue
+                when (current.syncState) {
+                    SyncState.LOCAL_NEW -> {
+                        val created = api.createDocument(
+                            serverUrl = serverUrl,
+                            apiKey = apiKey,
+                            title = current.title,
+                            text = current.text,
+                            collectionId = current.collectionId,
+                            parentDocumentId = current.parentDocumentId?.takeUnless { it.startsWith("local_") },
+                            publish = !current.isDraft,
+                        )
+                        val syncedEntity = created.toEntity(
+                            isStarred = current.isStarred,
+                            starId = current.starId,
+                            treeOrder = current.treeOrder,
+                        )
+                        dao.applyCreatedDocument(current.id, syncedEntity)
+                        pushedCount++
+                    }
+
+                    SyncState.LOCAL_MODIFIED -> {
+                        // Pre-flight conflict check. Outline's documents.update does not accept an optimistic-lock
+                        // revision parameter, so we pre-check revision/updatedAt and log any post-update revision jump.
+                        val remoteCheck = runCatching {
+                            api.getDocumentInfo(serverUrl, apiKey, current.id)
+                        }.onFailure { err ->
+                            SyncDiagnostics.log("SYNC", "预检远端版本失败 (${current.id}): ${err.message}")
+                        }.getOrNull()
+
+                        val hasRemoteDiverged = remoteCheck != null && hasConflict(current, remoteCheck)
+                        if (hasRemoteDiverged && remoteCheck != null) {
+                            dao.upsertDocument(
+                                current.copy(
+                                    syncState = SyncState.CONFLICT,
+                                    conflictServerTitle = remoteCheck.title,
+                                    conflictServerText = remoteCheck.text,
+                                    conflictServerUpdatedAt = remoteCheck.updatedAt,
+                                ),
+                            )
+                            conflictCount++
+                        } else {
+                            val updated = api.updateDocument(
+                                serverUrl = serverUrl,
+                                apiKey = apiKey,
+                                documentId = current.id,
+                                title = current.title,
+                                text = current.text,
+                                publish = if (!current.isDraft) true else null,
+                            )
+                            if (current.serverBaseRevision > 0 && updated.revision > current.serverBaseRevision + 1) {
+                                SyncDiagnostics.log(
+                                    "CONFLICT_WARN",
+                                    "文档 ${current.id} 提交时检测到版本号跳跃 (${current.serverBaseRevision} -> ${updated.revision})，请按需在网页端历史记录核对",
+                                )
+                            }
+                            dao.upsertDocument(
+                                updated.toEntity(
+                                    isStarred = current.isStarred,
+                                    starId = current.starId,
+                                    treeOrder = current.treeOrder,
+                                ),
+                            )
+                            pushedCount++
+                        }
+                    }
+
+                    SyncState.LOCAL_DELETED -> {
+                        if (current.id.startsWith("local_")) {
+                            dao.deleteDocumentById(current.id)
+                            pushedCount++
+                        } else {
+                            try {
+                                api.deleteDocument(serverUrl, apiKey, current.id)
+                                dao.deleteDocumentById(current.id)
+                                pushedCount++
+                            } catch (err: Exception) {
+                                if (err is OutlineApiException && err.statusCode == 404) {
+                                    dao.deleteDocumentById(current.id)
+                                    pushedCount++
+                                } else {
+                                    SyncDiagnostics.log("SYNC", "远端删除失败，保留本地待重试 (${current.id}): ${err.message}")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Step 2.5: Sync workspace branding (non-critical)
+            runCatching {
+                val auth = api.authInfo(serverUrl, apiKey)
+                val team = auth.team
+                if (team != null) {
+                    val logoUrl = team.avatarUrl.orEmpty()
+                    val accentHex = team.preferences?.customTheme?.accent.orEmpty()
+                    onUpdateBranding(team.name, logoUrl, accentHex)
+                    if (logoUrl.isNotBlank()) {
+                        withContext(Dispatchers.IO) {
+                            api.fetchAndCacheMediaBlocking(serverUrl, apiKey, logoUrl)
+                        }
+                    }
+                }
+            }.onFailure { err ->
+                SyncDiagnostics.log("BRAND", "同步工作区品牌信息跳过: ${err.message}")
+            }
+
+            // Step 3: Pull Collections atomically
+            val remoteCollections = api.listCollections(serverUrl, apiKey)
+            val collectionEntities = remoteCollections.mapIndexed { idx, col ->
+                CollectionEntity(
+                    id = col.id,
+                    name = col.name,
+                    description = col.description.orEmpty(),
+                    color = col.color ?: "#0366D6",
+                    icon = col.icon,
+                    sortIndex = col.index ?: idx.toString().padStart(4, '0'),
+                    updatedAt = col.updatedAt.orEmpty(),
+                )
+            }
+            dao.applyCollectionsSnapshot(collectionEntities)
+            if (collectionEntities.isNotEmpty() && defaultCollectionId.isBlank()) {
+                onSetDefaultCollection(collectionEntities.first().id)
+            }
+
+            // Step 4: Pull document hierarchy order for each collection (ordering only, non-destructive)
+            val treeOrderMap = mutableMapOf<String, Int>()
+            val parentFromTreeMap = mutableMapOf<String, String?>()
+            for (col in remoteCollections) {
+                val nodes = runCatching {
+                    api.collectionDocumentsTree(serverUrl, apiKey, col.id)
+                }.onFailure { err ->
+                    SyncDiagnostics.log("TREE", "拉取集合目录树失败 (${col.id}): ${err.message}")
+                }.getOrDefault(emptyList())
+                flattenTreeOrder(nodes, null, treeOrderMap, parentFromTreeMap)
+            }
+
+            // Step 5: Pull Stars (non-destructive if stars fails: preserve existing star flags)
+            val starsResult = runCatching { api.listStars(serverUrl, apiKey) }
+                .onFailure { err -> SyncDiagnostics.log("STARS", "拉取收藏列表失败: ${err.message}") }
+            val starsData = starsResult.getOrNull()
+            val starByDocId = starsData?.stars
+                ?.filter { !it.documentId.isNullOrBlank() }
+                ?.associateBy { it.documentId!! }
+
+            // Step 6: Pull ALL document buckets strictly — any failure aborts before local pruning (P0-1)!
+            val remoteDocs = api.listAllDocuments(serverUrl, apiKey)
+            val remoteDrafts = api.listDrafts(serverUrl, apiKey)
+            val remoteArchived = api.listArchivedDocuments(serverUrl, apiKey)
+            val remoteDeleted = api.listDeletedDocuments(serverUrl, apiKey)
+
+            val mergedRemoteMap = linkedMapOf<String, DocumentDto>()
+            remoteDocs.forEach { mergedRemoteMap[it.id] = it }
+            remoteDrafts.forEach { mergedRemoteMap.putIfAbsent(it.id, it) }
+            starsData?.documents?.forEach { mergedRemoteMap.putIfAbsent(it.id, it) }
+            remoteArchived.forEach { archivedDoc ->
+                val normalized = if (archivedDoc.archivedAt.isNullOrBlank()) {
+                    archivedDoc.copy(archivedAt = archivedDoc.updatedAt ?: Instant.now().toString())
+                } else {
+                    archivedDoc
+                }
+                mergedRemoteMap[normalized.id] = normalized
+            }
+            remoteDeleted.forEach { deletedDoc ->
+                val normalized = if (deletedDoc.deletedAt.isNullOrBlank()) {
+                    deletedDoc.copy(deletedAt = deletedDoc.updatedAt ?: Instant.now().toString())
+                } else {
+                    deletedDoc
+                }
+                mergedRemoteMap[normalized.id] = normalized
+            }
+
+            val existingLocalMap = dao.getAllDocuments().associateBy { it.id }
+            val toUpsert = mutableListOf<DocumentEntity>()
+
+            for ((docId, remote) in mergedRemoteMap) {
+                val local = existingLocalMap[docId]
+                val isStarred = if (starByDocId != null) starByDocId.containsKey(docId) else (local?.isStarred ?: false)
+                val starId = if (starByDocId != null) starByDocId[docId]?.id else local?.starId
+                val order = treeOrderMap[docId] ?: local?.treeOrder ?: 9999
+                val treeParent = parentFromTreeMap[docId] ?: remote.parentDocumentId
+
+                if (local != null && local.syncState != SyncState.SYNCED) {
+                    toUpsert.add(
+                        local.copy(
+                            isStarred = isStarred,
+                            starId = starId,
+                            isArchived = !remote.archivedAt.isNullOrBlank(),
+                            archivedAt = remote.archivedAt,
+                            isDeleted = !remote.deletedAt.isNullOrBlank(),
+                            deletedAt = remote.deletedAt,
+                            treeOrder = order,
+                            remoteMissingCount = 0,
+                        ),
+                    )
+                } else {
+                    toUpsert.add(
+                        remote.toEntity(
+                            isStarred = isStarred,
+                            starId = starId,
+                            treeOrder = order,
+                            overrideParentId = treeParent,
+                        ),
+                    )
+                }
+            }
+
+            // Two-phase pruning: only delete a SYNCED local doc after it is missing on 2 consecutive full syncs
+            val remoteIds = mergedRemoteMap.keys
+            val toMarkMissing = mutableListOf<String>()
+            val toDelete = mutableListOf<String>()
+            for ((localId, localDoc) in existingLocalMap) {
+                if (localDoc.syncState == SyncState.SYNCED && localId !in remoteIds) {
+                    if (localDoc.remoteMissingCount + 1 >= MISSING_DELETE_THRESHOLD) {
+                        SyncDiagnostics.log("SYNC", "远端连续 $MISSING_DELETE_THRESHOLD 次缺失，清理本地缓存文档 $localId")
+                        toDelete.add(localId)
+                    } else {
+                        toMarkMissing.add(localId)
+                    }
+                }
+            }
+
+            dao.applyPullBatch(
+                toUpsert = toUpsert,
+                toMarkMissing = toMarkMissing,
+                toDelete = toDelete,
+            )
+
+            SyncDiagnostics.log(
+                "SYNC",
+                "同步成功: pushed=$pushedCount, pulled=${toUpsert.size}, stars=${starsData?.stars?.size ?: -1}, archived=${remoteArchived.size}, trash=${remoteDeleted.size}, markedMissing=${toMarkMissing.size}, pruned=${toDelete.size}, conflicts=$conflictCount",
+            )
+            return SyncCycleOutcome(pushed = pushedCount, pulled = toUpsert.size, conflicts = conflictCount)
+        }
+
+        private suspend fun uploadPendingAttachmentsInternal(
+            serverUrl: String,
+            apiKey: String,
+            dao: OutlineDao,
+            api: OutlineApiClient,
+        ) {
+            val pendingList = dao.getAllPendingAttachments()
+            for (pending in pendingList) {
+                val file = File(pending.localFilePath)
+                if (!file.exists()) {
+                    dao.deletePendingAttachment(pending.id)
+                    continue
+                }
+                val uploaded = api.uploadAttachment(
+                    serverUrl = serverUrl,
+                    apiKey = apiKey,
+                    file = file,
+                    fileName = pending.fileName,
+                    contentType = pending.contentType,
+                    documentId = pending.documentId,
+                )
+                api.seedMediaCache(serverUrl, uploaded.url, file, pending.contentType)
+
+                val doc = dao.getDocumentById(pending.documentId)
+                if (doc != null && doc.text.contains(pending.localUriMarker)) {
+                    val updatedText = doc.text.replace(pending.localUriMarker, uploaded.url)
+                    val nextState = if (doc.syncState == SyncState.SYNCED) {
+                        SyncState.LOCAL_MODIFIED
+                    } else {
+                        doc.syncState
+                    }
+                    dao.upsertDocument(
+                        doc.copy(
+                            text = updatedText,
+                            localUpdatedAt = System.currentTimeMillis(),
+                            syncState = nextState,
+                        ),
+                    )
+                }
+                dao.deletePendingAttachment(pending.id)
+            }
+        }
+
+        private fun flattenTreeOrder(
+            nodes: List<NavigationNodeDto>,
+            parentId: String?,
+            orderOut: MutableMap<String, Int>,
+            parentOut: MutableMap<String, String?>,
+        ) {
+            for (node in nodes) {
+                orderOut[node.id] = orderOut.size
+                parentOut[node.id] = parentId
+                if (node.children.isNotEmpty()) {
+                    flattenTreeOrder(node.children, node.id, orderOut, parentOut)
+                }
+            }
+        }
 
         internal fun extractOutlineDocIdentifier(rawUrl: String, serverUrl: String): String? {
             val trimmed = rawUrl.trim()
@@ -860,6 +928,12 @@ enum class ConflictResolution {
     ACCEPT_SERVER,
     DUPLICATE_LOCAL,
 }
+
+internal data class SyncCycleOutcome(
+    val pushed: Int,
+    val pulled: Int,
+    val conflicts: Int,
+)
 
 private fun DocumentDto.toEntity(
     isStarred: Boolean = false,
